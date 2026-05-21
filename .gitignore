@@ -215,6 +215,9 @@ Thumbs.db:encryptable
 ehthumbs.db
 ehthumbs_vista.db
 
+# Others
+task.md
+
 # Dump file
 *.stackdump
 
@@ -233,3 +236,6 @@ $RECYCLE.BIN/
 
 # Windows shortcuts
 *.lnk
+
+# Data
+data/

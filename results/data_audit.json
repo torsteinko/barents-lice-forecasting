@@ -1,0 +1,16 @@
+{
+  "vlice_rows": 805846,
+  "vtreatment_rows": 64303,
+  "vlice_min_year": 2012,
+  "vlice_max_year": 2026,
+  "vtreatment_min_year": 2012,
+  "vtreatment_max_year": 2026,
+  "vlice_unique_sites": 1679,
+  "vtreatment_unique_sites": 1149,
+  "vlice_unique_production_areas": 13,
+  "vtreatment_unique_production_areas": 13,
+  "vlice_duplicate_site_weeks": 0,
+  "vtreatment_site_weeks_with_multiple_rows": 8454,
+  "vlice_counted_weeks": 399034,
+  "vlice_likely_no_fish_weeks": 383443
+}

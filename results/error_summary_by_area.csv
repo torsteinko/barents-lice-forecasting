@@ -1,0 +1,71 @@
+horizon,candidate_model,error_type,productionareaid,productionarea,count,average_score
+1,hist_gb_balanced,false_negative,6.0,Nordmøre og Sør-Trøndelag,32,0.6286383685106636
+1,hist_gb_balanced,false_negative,4.0,Nordhordaland til Stadt,29,0.6033055953975
+1,hist_gb_balanced,false_negative,3.0,Karmøy til Sotra,22,0.6172575651816327
+1,hist_gb_balanced,false_negative,8.0,Helgeland til Bodø,13,0.5161532182873609
+1,hist_gb_balanced,false_negative,10.0,Andøya til Senja,12,0.6724547608333046
+1,hist_gb_balanced,false_negative,9.0,Vestfjorden og Vesterålen,9,0.576934871222617
+1,hist_gb_balanced,false_negative,7.0,Nord-Trøndelag med Bindal,6,0.602310980632199
+1,hist_gb_balanced,false_negative,12.0,Vest-Finnmark,6,0.6168247323770982
+1,hist_gb_balanced,false_negative,11.0,Kvaløya til Loppa,5,0.6312770550495596
+1,hist_gb_balanced,false_negative,5.0,Stadt til Hustadvika,2,0.4878285624726173
+1,hist_gb_balanced,false_negative,1.0,Svenskegrensen til Jæren,1,0.1647791323410352
+1,hist_gb_balanced,false_negative,2.0,Ryfylke,1,0.2903531175097577
+1,hist_gb_balanced,false_positive,6.0,Nordmøre og Sør-Trøndelag,60,0.915350377963635
+1,hist_gb_balanced,false_positive,4.0,Nordhordaland til Stadt,39,0.9053900113629917
+1,hist_gb_balanced,false_positive,3.0,Karmøy til Sotra,31,0.9248465339187677
+1,hist_gb_balanced,false_positive,8.0,Helgeland til Bodø,23,0.9127417815128591
+1,hist_gb_balanced,false_positive,9.0,Vestfjorden og Vesterålen,22,0.9126604799459984
+1,hist_gb_balanced,false_positive,10.0,Andøya til Senja,15,0.9248875579895761
+1,hist_gb_balanced,false_positive,12.0,Vest-Finnmark,15,0.8943501651167829
+1,hist_gb_balanced,false_positive,7.0,Nord-Trøndelag med Bindal,9,0.8962309554894866
+1,hist_gb_balanced,false_positive,5.0,Stadt til Hustadvika,6,0.8920186005996295
+1,hist_gb_balanced,false_positive,11.0,Kvaløya til Loppa,6,0.9166429439541895
+1,hist_gb_balanced,false_positive,2.0,Ryfylke,1,0.8335832810846083
+2,hist_gb_balanced,false_negative,6.0,Nordmøre og Sør-Trøndelag,41,0.5535841064831051
+2,hist_gb_balanced,false_negative,4.0,Nordhordaland til Stadt,37,0.5203611418017811
+2,hist_gb_balanced,false_negative,3.0,Karmøy til Sotra,32,0.5753031587342685
+2,hist_gb_balanced,false_negative,8.0,Helgeland til Bodø,16,0.5332132268252726
+2,hist_gb_balanced,false_negative,10.0,Andøya til Senja,14,0.560345745375165
+2,hist_gb_balanced,false_negative,9.0,Vestfjorden og Vesterålen,12,0.5473648521007527
+2,hist_gb_balanced,false_negative,7.0,Nord-Trøndelag med Bindal,6,0.382376376510624
+2,hist_gb_balanced,false_negative,11.0,Kvaløya til Loppa,6,0.545914085768243
+2,hist_gb_balanced,false_negative,12.0,Vest-Finnmark,5,0.5414837436620041
+2,hist_gb_balanced,false_negative,1.0,Svenskegrensen til Jæren,2,0.1719279768123487
+2,hist_gb_balanced,false_negative,2.0,Ryfylke,2,0.30348838546852536
+2,hist_gb_balanced,false_negative,5.0,Stadt til Hustadvika,2,0.44035284916054696
+2,hist_gb_balanced,false_positive,6.0,Nordmøre og Sør-Trøndelag,142,0.8437096005394222
+2,hist_gb_balanced,false_positive,4.0,Nordhordaland til Stadt,88,0.8384630501152589
+2,hist_gb_balanced,false_positive,3.0,Karmøy til Sotra,68,0.8485443421928882
+2,hist_gb_balanced,false_positive,8.0,Helgeland til Bodø,59,0.8285649804787809
+2,hist_gb_balanced,false_positive,9.0,Vestfjorden og Vesterålen,52,0.8411416794871981
+2,hist_gb_balanced,false_positive,10.0,Andøya til Senja,41,0.8112988786935789
+2,hist_gb_balanced,false_positive,7.0,Nord-Trøndelag med Bindal,33,0.8122029118683871
+2,hist_gb_balanced,false_positive,12.0,Vest-Finnmark,24,0.8332419251698617
+2,hist_gb_balanced,false_positive,11.0,Kvaløya til Loppa,15,0.8402103262802036
+2,hist_gb_balanced,false_positive,5.0,Stadt til Hustadvika,13,0.8213972521773777
+2,hist_gb_balanced,false_positive,2.0,Ryfylke,11,0.7902535219431251
+12,xgb_gpu_balanced,false_negative,3.0,Karmøy til Sotra,42,0.3130135820025489
+12,xgb_gpu_balanced,false_negative,6.0,Nordmøre og Sør-Trøndelag,38,0.24502818257008724
+12,xgb_gpu_balanced,false_negative,4.0,Nordhordaland til Stadt,27,0.32558912535508466
+12,xgb_gpu_balanced,false_negative,9.0,Vestfjorden og Vesterålen,18,0.3728080574009153
+12,xgb_gpu_balanced,false_negative,7.0,Nord-Trøndelag med Bindal,17,0.33992528630530133
+12,xgb_gpu_balanced,false_negative,10.0,Andøya til Senja,12,0.37346291293700534
+12,xgb_gpu_balanced,false_negative,11.0,Kvaløya til Loppa,9,0.2999956127670076
+12,xgb_gpu_balanced,false_negative,5.0,Stadt til Hustadvika,7,0.3941279777458736
+12,xgb_gpu_balanced,false_negative,2.0,Ryfylke,6,0.25175370027621585
+12,xgb_gpu_balanced,false_negative,8.0,Helgeland til Bodø,5,0.42728595733642577
+12,xgb_gpu_balanced,false_negative,12.0,Vest-Finnmark,5,0.35360133647918696
+12,xgb_gpu_balanced,false_negative,1.0,Svenskegrensen til Jæren,2,0.40690232813358307
+12,xgb_gpu_balanced,false_positive,8.0,Helgeland til Bodø,232,0.6815701359561805
+12,xgb_gpu_balanced,false_positive,6.0,Nordmøre og Sør-Trøndelag,219,0.7311573454506322
+12,xgb_gpu_balanced,false_positive,10.0,Andøya til Senja,187,0.7019067263220721
+12,xgb_gpu_balanced,false_positive,4.0,Nordhordaland til Stadt,182,0.6735192534032759
+12,xgb_gpu_balanced,false_positive,3.0,Karmøy til Sotra,142,0.7346773428816191
+12,xgb_gpu_balanced,false_positive,9.0,Vestfjorden og Vesterålen,122,0.6708305912916778
+12,xgb_gpu_balanced,false_positive,2.0,Ryfylke,109,0.6891123387244863
+12,xgb_gpu_balanced,false_positive,7.0,Nord-Trøndelag med Bindal,108,0.6909028170285402
+12,xgb_gpu_balanced,false_positive,12.0,Vest-Finnmark,96,0.6395656823491057
+12,xgb_gpu_balanced,false_positive,5.0,Stadt til Hustadvika,89,0.6748199844628238
+12,xgb_gpu_balanced,false_positive,11.0,Kvaløya til Loppa,84,0.6649884709290096
+12,xgb_gpu_balanced,false_positive,1.0,Svenskegrensen til Jæren,8,0.697310384362936
