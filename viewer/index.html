@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Barents Lice Risk Atlas</title>
+    <title>Barents Lice Command Atlas</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -14,111 +14,178 @@
       href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="./map.css" />
+    <link rel="stylesheet" href="/viewer/map.css" />
   </head>
   <body>
-    <div class="shell">
-      <aside class="panel">
-        <div class="hero">
+    <div class="app-shell">
+      <div id="map"></div>
+
+      <header class="topbar glass-panel">
+        <div class="brand-block">
           <p class="eyebrow">Barents Lice Forecasting</p>
-          <h1>Site Risk Atlas</h1>
+          <h1>Operations Atlas</h1>
           <p class="subhead">
-            Latest site status, recent treatment context, and validated holdout
-            forecasts for 1, 2, and 12 weeks.
+            Full-screen site intelligence for forecast risk, treatment context,
+            and rapid operational triage.
           </p>
+          <div class="case-date-block">
+            <span class="case-date-label">Today's date in this case</span>
+            <strong class="case-date-value" id="case-date-value">--</strong>
+            <span class="case-date-note" id="case-date-note"
+              >All site status, treatment context, and answers are capped at the case cutoff.</span
+            >
+          </div>
         </div>
 
-        <section class="stats" id="stats-grid"></section>
-
-        <section class="controls">
-          <div class="controls-header">
+        <section class="metric-strip">
+          <div class="strip-label-row">
             <div>
-              <p class="section-kicker">Map Metric</p>
-              <h2>What the dots mean</h2>
+              <p class="eyebrow">Map metric</p>
+              <h2 id="metric-title">Near-term breach risk</h2>
             </div>
-            <span class="pill" id="metric-pill">12w breach risk</span>
+            <span class="badge" id="visible-summary">0 visible</span>
           </div>
-          <div class="metric-buttons" id="metric-buttons">
-            <button class="metric-button active" data-metric="classifier_12w_score">
-              12w breach risk
-            </button>
-            <button class="metric-button" data-metric="classifier_2w_score">
-              2w breach risk
-            </button>
-            <button class="metric-button" data-metric="classifier_1w_score">
-              1w breach risk
-            </button>
-            <button class="metric-button" data-metric="femaleadult_to_limit_ratio">
-              Current limit ratio
-            </button>
-          </div>
-
-          <div class="filters">
-            <label class="field">
-              <span>Production area</span>
-              <select id="area-filter">
-                <option value="all">All production areas</option>
-              </select>
-            </label>
-            <label class="field">
-              <span>Search site</span>
-              <input id="search-input" type="search" placeholder="Site name or id" />
-            </label>
-          </div>
-
-          <div class="legend" id="legend"></div>
+          <div class="metric-switcher" id="metric-switcher"></div>
         </section>
 
-        <section class="list-section">
-          <div class="section-header">
-            <div>
-              <p class="section-kicker">Priority Queue</p>
-              <h2>Sites to inspect</h2>
-            </div>
-            <span class="pill" id="site-count-pill">0 visible</span>
-          </div>
-          <div class="site-list" id="site-list"></div>
-        </section>
+        <div class="topbar-actions">
+          <button type="button" class="ghost-button" id="fit-visible-button">
+            Fit visible sites
+          </button>
+          <button type="button" class="ghost-button" id="reset-filters-button">
+            Reset filters
+          </button>
+        </div>
+      </header>
 
-        <section class="detail-section">
-          <div class="section-header">
-            <div>
-              <p class="section-kicker">Selected Site</p>
-              <h2>Operational detail</h2>
-            </div>
-          </div>
-          <div id="detail-panel" class="detail-panel"></div>
-        </section>
+      <aside class="panel panel-left glass-panel" id="filters-panel">
+        <div class="panel-scroll">
+          <section class="stats-grid" id="stats-grid"></section>
 
-        <p class="note">
-          Forecast cards use the latest validated holdout prediction per horizon.
-          Observation and treatment cards use the latest available site row, which
-          can be later than the forecast date.
-        </p>
+          <details class="panel-section" open>
+            <summary>
+              <span>Filters</span>
+              <span class="section-note">Hide noise fast</span>
+            </summary>
+            <div class="section-content">
+              <div class="chip-block">
+                <div class="block-header">
+                  <h3>Risk status</h3>
+                  <span>Based on the active metric</span>
+                </div>
+                <div class="chip-row" id="risk-filter-row"></div>
+              </div>
+
+              <div class="field-grid">
+                <label class="field">
+                  <span>Production area</span>
+                  <select id="area-filter">
+                    <option value="all">All production areas</option>
+                  </select>
+                </label>
+                <label class="field">
+                  <span>County</span>
+                  <select id="county-filter">
+                    <option value="all">All counties</option>
+                  </select>
+                </label>
+              </div>
+
+              <label class="field">
+                <span>Search site</span>
+                <input
+                  id="search-input"
+                  type="search"
+                  placeholder="Site name, id, municipality"
+                />
+              </label>
+
+              <div class="toggle-grid">
+                <label class="toggle-pill">
+                  <input type="checkbox" id="over-limit-toggle" />
+                  <span>Only currently over limit</span>
+                </label>
+                <label class="toggle-pill">
+                  <input type="checkbox" id="recent-treatment-toggle" />
+                  <span>Treated in last 4 weeks</span>
+                </label>
+                <label class="toggle-pill">
+                  <input type="checkbox" id="counted-only-toggle" />
+                  <span>Counted lice this week</span>
+                </label>
+              </div>
+
+              <div class="legend-block" id="legend"></div>
+            </div>
+          </details>
+
+          <details class="panel-section" open>
+            <summary>
+              <span>Priority queue</span>
+              <span class="section-note" id="queue-summary">Top visible sites</span>
+            </summary>
+            <div class="section-content section-scroll">
+              <div class="site-list" id="site-list"></div>
+            </div>
+          </details>
+        </div>
       </aside>
 
-      <main class="map-shell">
-        <div class="map-header">
+      <aside class="panel panel-right glass-panel" id="detail-panel-shell">
+        <div class="panel-scroll" id="detail-panel"></div>
+      </aside>
+
+      <div class="chat-backdrop" id="chat-backdrop"></div>
+
+      <aside class="chat-dock glass-panel" id="chat-dock">
+        <div class="chat-header">
           <div>
-            <p class="section-kicker">Interactive Viewer</p>
-            <h2 id="map-title">12w breach risk</h2>
+            <p class="eyebrow">AI Analyst</p>
+            <h2>Ask the map</h2>
+            <p class="chat-subhead">
+              Ask for exact matches, near-misses, ranked risk, or where to fly the map.
+            </p>
           </div>
-          <div class="map-meta">
-            <div>
-              <span class="meta-label">Default focus</span>
-              <strong id="top-site-label">Loading</strong>
-            </div>
-            <div>
-              <span class="meta-label">Basemap</span>
-              <strong>Carto Dark Matter</strong>
-            </div>
-          </div>
+          <button type="button" class="ghost-button compact" id="toggle-chat-button">
+            Hide panel
+          </button>
         </div>
-        <div id="map"></div>
-      </main>
+
+        <div class="suggestion-row" id="chat-suggestions"></div>
+        <div class="chat-transcript" id="chat-transcript"></div>
+
+        <form id="chat-form" class="chat-form">
+          <textarea
+            id="chat-input"
+            rows="2"
+            placeholder="Ask for the highest-risk sites, compare areas, or ask for coordinates and the map will take you there."
+          ></textarea>
+          <div class="chat-actions">
+            <span id="chat-status"
+              >Gemini on Vertex when available, with rule-based reasoning as a fallback.</span
+            >
+            <button type="submit" class="primary-button" id="chat-submit-button">
+              Ask
+            </button>
+          </div>
+        </form>
+      </aside>
+
+      <button type="button" class="assistant-launch visible" id="open-chat-button">
+        Open analyst
+      </button>
+
+      <button type="button" class="panel-toggle left" id="mobile-filters-button">
+        Filters
+      </button>
+      <button type="button" class="panel-toggle right" id="mobile-details-button">
+        Site detail
+      </button>
     </div>
 
     <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
-    <script src="./map.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.6/dist/purify.min.js"></script>
+    <script src="/viewer/map.js"></script>
   </body>
 </html>
