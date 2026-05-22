@@ -32,17 +32,35 @@ The notebook is artifact-driven by default and now explains:
 - the selective GPU model policy,
 - and the interactive map workflow.
 
-## Interactive map
+## Interactive map and API
 
-Serve the repository root and open the static viewer:
+Start the FastAPI app:
 
 ```powershell
-python -m http.server 8765
+python run_web.py
 ```
 
-Then open `http://127.0.0.1:8765/viewer/` in a browser.
+Then open `http://127.0.0.1:8000/` in a browser.
 
-The map shows each site with current status, last treatment context, surrounding pressure, and the latest validated holdout predictions.
+The viewer is now a full-screen map application with:
+
+- floating filter and detail panels,
+- risk-status filtering on the active breach metric,
+- site search, county, and production-area filters,
+- a hovering chat box that can rank sites and jump the map to a returned site,
+- and FastAPI endpoints for the site dataset and chat workflow.
+
+Primary endpoints:
+
+- `GET /api/health`
+- `GET /api/sites`
+- `POST /chat`
+
+The chat endpoint uses deterministic ranking by default. If Vertex Gemini is configured, the backend will use it to turn the ranked site context into a more natural answer.
+
+Optional Vertex Gemini environment variables are found in .env.example.
+
+Authentication should come from Application Default Credentials, for example through `gcloud auth application-default login` or a service-account-backed environment.
 
 ## Outputs
 
@@ -55,7 +73,7 @@ The map shows each site with current status, last treatment context, surrounding
 - `results/feature_columns.csv`: feature list used by the models.
 - `results/models/*.pkl`: serialized baseline models.
 - `notebooks/01_baseline_walkthrough.ipynb`: presentation notebook built on top of the reusable pipeline code.
-- `viewer/`: static MapLibre viewer for site-level inspection.
+- `viewer/`: frontend assets served by the FastAPI map application.
 
 ## Current modeling scope
 

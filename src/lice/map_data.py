@@ -63,6 +63,16 @@ def build_site_map_frame(
     predictions: pd.DataFrame,
     vtreatment: pd.DataFrame,
 ) -> pd.DataFrame:
+    predictions = predictions.copy()
+    predictions["week_start_date"] = pd.to_datetime(
+        predictions["week_start_date"], errors="coerce"
+    )
+    case_cutoff_date = _derive_case_cutoff_date(predictions)
+    if case_cutoff_date is not None:
+        master = master[master["week_start_date"] <= case_cutoff_date].copy()
+        vtreatment = vtreatment[vtreatment["week_start_date"] <= case_cutoff_date].copy()
+        predictions = predictions[predictions["week_start_date"] <= case_cutoff_date].copy()
+
     latest_status = _build_latest_status(master)
     latest_treatment = _build_latest_treatment(vtreatment)
     prediction_snapshot = _build_prediction_snapshot(predictions)
@@ -124,6 +134,8 @@ def build_site_map_frame(
         ["max_breach_risk", "femaleadult_to_limit_ratio", "femaleadult"],
         ascending=[False, False, False],
     ).reset_index(drop=True)
+    if case_cutoff_date is not None:
+        frame.attrs["case_cutoff_date"] = case_cutoff_date.date().isoformat()
     return frame
 
 
@@ -132,6 +144,7 @@ def build_site_map_geojson(site_map: pd.DataFrame) -> dict[str, object]:
     property_columns = [
         column for column in site_map.columns if column not in {"latitude", "longitude"}
     ]
+    case_cutoff_date = site_map.attrs.get("case_cutoff_date")
 
     for row in site_map.itertuples(index=False):
         latitude = getattr(row, "latitude", None)
@@ -157,10 +170,31 @@ def build_site_map_geojson(site_map: pd.DataFrame) -> dict[str, object]:
         "type": "FeatureCollection",
         "metadata": {
             "feature_count": len(features),
-            "description": "Latest site snapshot with latest holdout predictions and treatment context.",
+            "description": "Case snapshot capped at the prediction-supported cutoff date, with treatment context and holdout predictions aligned to the same case date.",
+            "case_cutoff_date": case_cutoff_date,
         },
         "features": features,
     }
+
+
+def _derive_case_cutoff_date(predictions: pd.DataFrame) -> pd.Timestamp | None:
+    if predictions.empty or "week_start_date" not in predictions.columns:
+        return None
+
+    dated = predictions[predictions["week_start_date"].notna()].copy()
+    if dated.empty:
+        return None
+
+    group_columns = [
+        column for column in ["horizon", "model_type"] if column in dated.columns
+    ]
+    if not group_columns:
+        return dated["week_start_date"].max()
+
+    latest_per_group = dated.groupby(group_columns)["week_start_date"].max()
+    if latest_per_group.empty:
+        return dated["week_start_date"].max()
+    return pd.to_datetime(latest_per_group.min())
 
 
 def _build_latest_status(master: pd.DataFrame) -> pd.DataFrame:
