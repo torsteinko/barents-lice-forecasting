@@ -3,12 +3,15 @@ from __future__ import annotations
 import json
 import os
 import re
-import unicodedata
-from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Sequence
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import create_engine
+from sqlalchemy.pool import StaticPool
 
 from .config import PROCESSED_DIR, RESULTS_DIR
 
@@ -18,36 +21,124 @@ except ImportError:
     google = None
 
 try:
-    from google import genai
+    from langchain_community.agent_toolkits.sql.base import create_sql_agent
+    from langchain_community.agent_toolkits.sql.toolkit import (
+        SQLDatabaseToolkit as BaseSQLDatabaseToolkit,
+    )
+    from langchain_community.tools.sql_database.tool import (
+        InfoSQLDatabaseTool,
+        ListSQLDatabaseTool,
+        QuerySQLCheckerTool,
+        QuerySQLDatabaseTool as BaseQuerySQLDatabaseTool,
+    )
+    from langchain_community.utilities import SQLDatabase
+    from langchain_google_vertexai import ChatVertexAI
 except ImportError:
-    genai = None
+    create_sql_agent = None
+    BaseSQLDatabaseToolkit = None
+    BaseQuerySQLDatabaseTool = None
+    InfoSQLDatabaseTool = None
+    ListSQLDatabaseTool = None
+    QuerySQLCheckerTool = None
+    SQLDatabase = None
+    ChatVertexAI = None
 
 
-DEFAULT_CHAT_MODEL = "gemini-2.5-flash"
+DEFAULT_CHAT_MODEL = "gemini-3.1-flash-lite"
+DEFAULT_SITE_CARD_METRIC = "near_term_risk"
+DEFAULT_SQL_TOP_K = 10
+READ_ONLY_ALLOWED_LEADING_KEYWORDS = {"select", "with"}
+READ_ONLY_BLOCKED_KEYWORDS = {
+    "alter",
+    "analyze",
+    "attach",
+    "call",
+    "comment",
+    "commit",
+    "copy",
+    "create",
+    "delete",
+    "detach",
+    "drop",
+    "execute",
+    "export",
+    "grant",
+    "insert",
+    "install",
+    "load",
+    "merge",
+    "pragma",
+    "prepare",
+    "replace",
+    "revoke",
+    "rollback",
+    "set",
+    "show",
+    "truncate",
+    "update",
+    "use",
+    "vacuum",
+}
+READ_ONLY_BLOCKED_FUNCTIONS = {
+    "glob",
+    "read_csv",
+    "read_csv_auto",
+    "read_json",
+    "read_ndjson",
+    "read_parquet",
+    "read_text",
+    "sniff_csv",
+}
 
 
-@dataclass
-class QueryPlan:
-    frame: pd.DataFrame
-    metric_key: str
-    metric_label: str
-    descending: bool
-    filters_applied: list[str]
-    proxy_note: str | None
-    top_n: int
+class AgentResultPayload(BaseModel):
+    answer: str = Field(default="")
+    sitenumbers: list[str] = Field(default_factory=list)
+
+    model_config = ConfigDict(extra="ignore")
 
 
-@dataclass
-class AnswerContext:
-    ranked: pd.DataFrame
-    question_type: str
-    candidate_mode: str
-    summary: str
-    rationale: list[str]
-    exact_match_count: int | None = None
-    supporting_title: str | None = None
-    supporting_rows: list[dict[str, object]] | None = None
-    window_note: str | None = None
+if BaseQuerySQLDatabaseTool is not None and BaseSQLDatabaseToolkit is not None:
+
+    class ReadOnlyQuerySQLDatabaseTool(BaseQuerySQLDatabaseTool):
+        name: str = "sql_db_query"
+        description: str = (
+            "Execute exactly one read-only SELECT or WITH SQL query against the database. "
+            "Only the master_table and visible_master_table views are allowed. "
+            "If an error is returned, rewrite the query, re-check it, and try again."
+        )
+
+        def _run(self, query: str, run_manager: Any = None) -> Any:
+            violation = _validate_read_only_query(query)
+            if violation is not None:
+                return f"Error: {violation}"
+            return self.db.run_no_throw(query, include_columns=True)
+
+
+    class ReadOnlySQLDatabaseToolkit(BaseSQLDatabaseToolkit):
+        def get_tools(self) -> list[Any]:
+            list_tool = ListSQLDatabaseTool(db=self.db)
+            info_tool = InfoSQLDatabaseTool(
+                db=self.db,
+                description=(
+                    "Input to this tool is a comma-separated list of tables, output is the "
+                    "schema and sample rows for those tables. Be sure that the tables exist "
+                    f"by calling {list_tool.name} first. Example input: table1, table2"
+                ),
+            )
+            query_tool = ReadOnlyQuerySQLDatabaseTool(db=self.db)
+            query_checker_tool = QuerySQLCheckerTool(
+                db=self.db,
+                llm=self.llm,
+                description=(
+                    "Use this tool to double check if your query is correct before executing "
+                    f"it. Always use this tool before executing a query with {query_tool.name}."
+                ),
+            )
+            return [query_tool, info_tool, list_tool, query_checker_tool]
+
+else:
+    ReadOnlySQLDatabaseToolkit = None
 
 
 class SiteChatService:
@@ -57,13 +148,19 @@ class SiteChatService:
         master_table_path: Path | None = None,
     ) -> None:
         self.geojson_path = geojson_path or RESULTS_DIR / "site_map.geojson"
-        self.master_table_path = master_table_path or PROCESSED_DIR / "master_table.parquet"
+        self.master_table_path = (
+            master_table_path or PROCESSED_DIR / "master_table.parquet"
+        )
         self._cached_geojson: dict[str, object] | None = None
         self._cached_frame: pd.DataFrame | None = None
-        self._cached_history_frame: pd.DataFrame | None = None
+        self._cached_site_index: pd.DataFrame | None = None
         self._cached_mtime: float | None = None
-        self._cached_history_mtime: float | None = None
-        self._cached_client = None
+        self._cached_parquet_mtime: float | None = None
+        self._cached_parquet_columns: set[str] = set()
+        self._parquet_schema_error: str | None = None
+        self._cached_llm: Any | None = None
+        self._cached_llm_config: tuple[str, str, str] | None = None
+        self._cached_extractor: Any | None = None
         self._last_llm_error: str | None = None
         self._case_cutoff_date: pd.Timestamp | None = None
 
@@ -92,9 +189,16 @@ class SiteChatService:
         else:
             adc_error = "google-auth is not installed"
 
-        configured = bool(project and location)
+        configured = bool(
+            project
+            and location
+            and ChatVertexAI is not None
+            and create_sql_agent is not None
+            and SQLDatabase is not None
+            and ReadOnlySQLDatabaseToolkit is not None
+        )
         return {
-            "provider": "vertex-gemini" if genai is not None else "fallback-only",
+            "provider": "vertex-gemini" if ChatVertexAI is not None else "fallback-only",
             "configured": configured,
             "project": project,
             "location": location,
@@ -112,61 +216,71 @@ class SiteChatService:
         visible_site_ids: list[str] | None = None,
     ) -> dict[str, object]:
         self._ensure_loaded()
-        assert self._cached_frame is not None
+        message_text = str(message or "").strip()
 
-        working = self._cached_frame.copy()
-        if visible_site_ids:
-            visible_ids = {str(site_id) for site_id in visible_site_ids}
-            working = working[working["site_id"].isin(visible_ids)].copy()
+        if not message_text:
+            return self._build_failure_response(
+                "Chat messages cannot be empty.",
+                selected_site_id=selected_site_id,
+                visible_site_ids=visible_site_ids,
+            )
 
-        query_plan = self._build_query_plan(message, working)
-        answer_context = self._build_answer_context(message, query_plan)
-        ranked = answer_context.ranked
+        if self._cached_frame is None:
+            return self._build_failure_response(
+                "The site snapshot is not available right now.",
+                selected_site_id=selected_site_id,
+                visible_site_ids=visible_site_ids,
+            )
 
-        if ranked.empty and not answer_context.supporting_rows:
-            return {
-                "answer": "No sites matched the current question and the active map filters. Try widening the area filter or removing extra constraints.",
-                "used_llm": False,
-                "metric_key": query_plan.metric_key,
-                "metric_label": query_plan.metric_label,
-                "filters_applied": query_plan.filters_applied,
-                "proxy_note": query_plan.proxy_note,
-                "sites": [],
-                "llm": self.get_llm_status(),
-            }
+        if not self.master_table_path.exists():
+            self._last_llm_error = f"Missing chat dataset at {self.master_table_path}"
+            return self._build_failure_response(
+                "The chat dataset is not available right now.",
+                selected_site_id=selected_site_id,
+                visible_site_ids=visible_site_ids,
+            )
 
-        selected_site = None
-        if selected_site_id and not ranked.empty:
-            selected_rows = ranked[ranked["site_id"] == str(selected_site_id)]
-            if not selected_rows.empty:
-                selected_site = self._serialize_site(
-                    selected_rows.iloc[0], query_plan.metric_key
-                )
+        if self._parquet_schema_error is not None:
+            self._last_llm_error = self._parquet_schema_error
+            return self._build_failure_response(
+                "The chat dataset could not be inspected safely.",
+                selected_site_id=selected_site_id,
+                visible_site_ids=visible_site_ids,
+            )
 
-        site_cards = (
-            [
-                self._serialize_site(row, query_plan.metric_key)
-                for _, row in ranked.head(query_plan.top_n).iterrows()
-            ]
-            if not ranked.empty
-            else []
-        )
-        answer, used_llm = self._generate_answer(
-            message,
-            query_plan,
-            answer_context,
-            site_cards,
-            selected_site,
-        )
+        self._last_llm_error = None
+        engine = None
+        try:
+            engine = self._create_duckdb_engine()
+            database = self._create_sql_database(engine, visible_site_ids)
+            raw_output = self._run_sql_agent(
+                message_text,
+                database,
+                selected_site_id=selected_site_id,
+                visible_site_ids=visible_site_ids,
+            )
+            parsed = self._parse_agent_result(message_text, raw_output)
+        except Exception as exc:
+            self._last_llm_error = _truncate_error(exc)
+            return self._build_failure_response(
+                "The SQL chat agent could not answer this request.",
+                selected_site_id=selected_site_id,
+                visible_site_ids=visible_site_ids,
+            )
+        finally:
+            if engine is not None:
+                engine.dispose()
 
         return {
-            "answer": answer,
-            "used_llm": used_llm,
-            "metric_key": query_plan.metric_key,
-            "metric_label": query_plan.metric_label,
-            "filters_applied": query_plan.filters_applied,
-            "proxy_note": query_plan.proxy_note,
-            "sites": site_cards,
+            "answer": parsed.answer,
+            "used_llm": True,
+            "metric_key": DEFAULT_SITE_CARD_METRIC,
+            "metric_label": "current snapshot context",
+            "filters_applied": self._build_scope_notes(
+                selected_site_id, visible_site_ids
+            ),
+            "proxy_note": self._build_scope_note(visible_site_ids),
+            "sites": self._hydrate_sites(parsed.sitenumbers),
             "llm": self.get_llm_status(),
         }
 
@@ -175,7 +289,7 @@ class SiteChatService:
             raise FileNotFoundError(f"Missing map dataset at {self.geojson_path}")
 
         current_mtime = self.geojson_path.stat().st_mtime
-        history_mtime = (
+        parquet_mtime = (
             self.master_table_path.stat().st_mtime
             if self.master_table_path.exists()
             else None
@@ -184,8 +298,7 @@ class SiteChatService:
             self._cached_geojson is not None
             and self._cached_frame is not None
             and self._cached_mtime == current_mtime
-            and self._cached_history_frame is not None
-            and self._cached_history_mtime == history_mtime
+            and self._cached_parquet_mtime == parquet_mtime
         ):
             return
 
@@ -269,663 +382,314 @@ class SiteChatService:
             frame["site_label"].replace("", np.nan).fillna(frame["site_id"])
         )
 
-        history_frame = self._load_history_frame(case_cutoff_date)
+        parquet_columns: set[str] = set()
+        parquet_schema_error = None
+        if self.master_table_path.exists():
+            try:
+                parquet_columns = set(
+                    pq.ParquetFile(self.master_table_path).schema.names
+                )
+            except Exception as exc:
+                parquet_schema_error = _truncate_error(exc)
+
+        site_index = (
+            frame.drop_duplicates("site_id").set_index("site_id", drop=False)
+            if not frame.empty and "site_id" in frame.columns
+            else pd.DataFrame()
+        )
 
         self._cached_geojson = geojson
         self._cached_frame = frame
-        self._cached_history_frame = history_frame
+        self._cached_site_index = site_index
         self._cached_mtime = current_mtime
-        self._cached_history_mtime = history_mtime
+        self._cached_parquet_mtime = parquet_mtime
+        self._cached_parquet_columns = parquet_columns
+        self._parquet_schema_error = parquet_schema_error
         self._case_cutoff_date = case_cutoff_date
 
-    def _load_history_frame(
-        self, case_cutoff_date: pd.Timestamp | None = None
-    ) -> pd.DataFrame:
-        if not self.master_table_path.exists():
-            return pd.DataFrame()
-
-        history_columns = [
-            "sitenumber",
-            "sitename",
-            "productionarea",
-            "county",
-            "municipality",
-            "week_start_date",
-            "femaleadult",
-            "mobilelice",
-            "persistentlice",
-            "seatemperature",
-            "femaleadult_to_limit_ratio",
-            "breach_this_week",
-            "havecountedlice",
-            "any_treatment",
-            "treatment_count",
-            "any_treatment_roll4_sum",
-            "neighbor_femaleadult_to_limit_ratio_lag1",
-            "pa_breach_rate_lag1",
-            "pa_treatment_rate_lag1",
-        ]
-        try:
-            history = pd.read_parquet(self.master_table_path, columns=history_columns)
-        except Exception:
-            history = pd.read_parquet(self.master_table_path)
-            history = history[[column for column in history_columns if column in history.columns]]
-
-        if history.empty:
-            return history
-
-        if "week_start_date" in history.columns:
-            history["week_start_date"] = pd.to_datetime(
-                history["week_start_date"], errors="coerce"
-            )
-
-        for column in [
-            "femaleadult",
-            "mobilelice",
-            "persistentlice",
-            "seatemperature",
-            "femaleadult_to_limit_ratio",
-            "treatment_count",
-            "any_treatment_roll4_sum",
-            "neighbor_femaleadult_to_limit_ratio_lag1",
-            "pa_breach_rate_lag1",
-            "pa_treatment_rate_lag1",
-        ]:
-            if column in history.columns:
-                history[column] = pd.to_numeric(history[column], errors="coerce")
-
-        for column in ["breach_this_week", "havecountedlice", "any_treatment"]:
-            if column in history.columns:
-                history[column] = history[column].astype("boolean")
-
-        history["site_id"] = history.get("sitenumber", pd.Series(dtype=object)).astype(
-            str
+    def _create_duckdb_engine(self) -> Any:
+        return create_engine(
+            "duckdb:///:memory:",
+            poolclass=StaticPool,
+            future=True,
         )
-        history["site_label"] = history.get("sitename", pd.Series(dtype=object)).fillna("")
-        history["site_label"] = (
-            history["site_label"].replace("", np.nan).fillna(history["site_id"])
+
+    def _create_sql_database(
+        self,
+        engine: Any,
+        visible_site_ids: Sequence[str] | None,
+    ) -> Any:
+        parquet_path = self.master_table_path.resolve().as_posix()
+        with engine.begin() as connection:
+            connection.exec_driver_sql(self._build_master_view_sql(parquet_path))
+            connection.exec_driver_sql(self._build_visible_view_sql(visible_site_ids))
+
+        return SQLDatabase(
+            engine=engine,
+            include_tables=["master_table", "visible_master_table"],
+            view_support=True,
+            sample_rows_in_table_info=2,
+            max_string_length=500,
         )
-        if case_cutoff_date is not None and "week_start_date" in history.columns:
-            history = history[history["week_start_date"] <= case_cutoff_date].copy()
-        return history
 
-    def _build_query_plan(self, message: str, frame: pd.DataFrame) -> QueryPlan:
-        query = _normalize_text(message)
-        working = frame.copy()
-        filters_applied: list[str] = []
-        is_current_limit_query = _is_current_limit_query(query)
+    def _build_master_view_sql(self, parquet_path: str) -> str:
+        where_clause = self._build_case_cutoff_where_clause()
+        return (
+            "CREATE OR REPLACE VIEW master_table AS "
+            f"SELECT * FROM read_parquet({_quote_sql_literal(parquet_path)}){where_clause}"
+        )
 
-        for column, label in [
-            ("productionarea", "production area"),
-            ("county", "county"),
-            ("municipality", "municipality"),
-            ("sitename", "site"),
-        ]:
-            matches = self._match_named_values(query, working.get(column))
-            if matches:
-                working = working[working[column].isin(matches)].copy()
-                filters_applied.append(f"{label}: {', '.join(matches)}")
-
+    def _build_case_cutoff_where_clause(self) -> str:
         if (
-            "currently_over_limit" in working.columns
-            and not is_current_limit_query
-            and any(
-            token in query for token in ["over limit", "above limit", "breach now"]
+            self._case_cutoff_date is not None
+            and "week_start_date" in self._cached_parquet_columns
+        ):
+            cutoff = self._case_cutoff_date.date().isoformat()
+            return f" WHERE CAST(week_start_date AS DATE) <= DATE {_quote_sql_literal(cutoff)}"
+        if "year" in self._cached_parquet_columns:
+            return " WHERE CAST(year AS INTEGER) <= 2025"
+        return ""
+
+    def _build_visible_view_sql(self, visible_site_ids: Sequence[str] | None) -> str:
+        if visible_site_ids is None:
+            return (
+                "CREATE OR REPLACE VIEW visible_master_table AS "
+                "SELECT * FROM master_table"
             )
-        ):
-            working = working[working["currently_over_limit"].fillna(False)].copy()
-            filters_applied.append("currently over limit")
 
-        if "weeks_since_any_treatment" in working.columns and any(
-            token in query
-            for token in ["recent treatment", "recently treated", "treated recently"]
-        ):
-            working = working[
-                working["weeks_since_any_treatment"].fillna(np.inf) <= 4
-            ].copy()
-            filters_applied.append("treated within last 4 weeks")
+        normalized_ids = _normalize_site_ids(visible_site_ids)
+        if not normalized_ids:
+            return (
+                "CREATE OR REPLACE VIEW visible_master_table AS "
+                "SELECT * FROM master_table WHERE 1 = 0"
+            )
 
-        if "havecountedlice" in working.columns and any(
-            token in query for token in ["counted", "reported lice", "reported count"]
-        ):
-            working = working[working["havecountedlice"].fillna(False)].copy()
-            filters_applied.append("reported lice count available")
-
-        metric_key = "classifier_12w_score"
-        metric_label = "12-week breach risk"
-        proxy_note = None
-
-        if is_current_limit_query:
-            metric_key = "femaleadult_to_limit_ratio"
-            metric_label = "current female-adult-to-limit ratio"
-        elif _contains_any(
-            query,
-            [
-                "4 weeks",
-                "4 week",
-                "next month",
-                "four weeks",
-                "near term",
-                "short term",
-                "coming weeks",
-                "next weeks",
-            ],
-        ):
-            metric_key = "near_term_risk"
-            metric_label = "near-term breach risk"
-            proxy_note = "Near-term risk uses the maximum of the 1-week and 2-week breach probabilities because the trained classifier horizons are 1w, 2w, and 12w."
-        elif _contains_any(query, ["2 weeks", "2 week", "two weeks", "fortnight"]):
-            metric_key = "classifier_2w_score"
-            metric_label = "2-week breach risk"
-        elif _contains_any(query, ["1 week", "1-week", "one week", "next week"]):
-            metric_key = "classifier_1w_score"
-            metric_label = "1-week breach risk"
-        elif _contains_any(
-            query,
-            ["12 weeks", "12 week", "three months", "12-week", "long term", "season"],
-        ):
-            metric_key = "classifier_12w_score"
-            metric_label = "12-week breach risk"
-        elif _contains_any(
-            query, ["current pressure", "limit ratio", "adult lice ratio"]
-        ):
-            metric_key = "femaleadult_to_limit_ratio"
-            metric_label = "current female-adult-to-limit ratio"
-        elif _contains_any(
-            query, ["predicted lice count", "expected lice count", "count forecast"]
-        ):
-            metric_key = "count_12w_prediction"
-            metric_label = "12-week predicted lice count"
-
-        descending = not _contains_any(query, ["lowest", "safest", "least", "smallest"])
-        top_n = 5
-        match = re.search(r"top\s+(\d+)", query)
-        if match:
-            top_n = max(1, min(15, int(match.group(1))))
-        elif _contains_any(query, ["list", "show me", "which sites", "rank"]):
-            top_n = 7
-
-        return QueryPlan(
-            frame=working,
-            metric_key=metric_key,
-            metric_label=metric_label,
-            descending=descending,
-            filters_applied=filters_applied,
-            proxy_note=proxy_note,
-            top_n=top_n,
+        quoted_ids = ", ".join(_quote_sql_literal(site_id) for site_id in normalized_ids)
+        return (
+            "CREATE OR REPLACE VIEW visible_master_table AS "
+            "SELECT * FROM master_table "
+            f"WHERE CAST(sitenumber AS VARCHAR) IN ({quoted_ids})"
         )
 
-    def _build_answer_context(
+    def _run_sql_agent(
         self,
         message: str,
-        query_plan: QueryPlan,
-    ) -> AnswerContext:
-        working = query_plan.frame.copy()
-        normalized_query = _normalize_text(message)
-        question_type = _detect_question_type(normalized_query)
-
-        if question_type == "current_limit_status":
-            if "currently_over_limit" in working.columns:
-                exact_matches = working[working["currently_over_limit"].fillna(False)].copy()
-            else:
-                exact_matches = working.head(0).copy()
-
-            if not exact_matches.empty:
-                ranked = self._sort_limit_candidates(exact_matches)
-                return AnswerContext(
-                    ranked=ranked,
-                    question_type="current_limit_status",
-                    candidate_mode="exact-matches",
-                    summary=f"{len(ranked)} visible site(s) are already above the lice limit.",
-                    rationale=[
-                        "Exact matches are defined by currently_over_limit = true.",
-                        "Matching sites are ranked by the current female-adult-to-limit ratio.",
-                    ],
-                    exact_match_count=int(len(ranked)),
-                )
-
-            ranked = self._sort_limit_candidates(working)
-            return AnswerContext(
-                ranked=ranked,
-                question_type="current_limit_status",
-                candidate_mode="near-misses",
-                summary="No visible sites are currently above the lice limit.",
-                rationale=[
-                    "No visible site has currently_over_limit = true in the active filter set.",
-                    "Nearest alternatives are ranked by the current female-adult-to-limit ratio.",
-                ],
-                exact_match_count=0,
-            )
-
-        if question_type == "area_pressure":
-            return self._build_area_pressure_context(query_plan)
-
-        if question_type == "repeated_breaches":
-            return self._build_repeated_breach_context(query_plan)
-
-        if question_type == "treatment_intensity_area":
-            return self._build_treatment_intensity_context(query_plan)
-
-        if question_type == "pre_breach_patterns":
-            return self._build_pre_breach_pattern_context(query_plan)
-
-        ranked = self._rank_sites(query_plan)
-        rationale: list[str] = [f"Candidates are ranked by {query_plan.metric_label}."]
-        if query_plan.filters_applied:
-            rationale.append(
-                f"Active filters: {', '.join(query_plan.filters_applied)}."
-            )
-        if query_plan.proxy_note:
-            rationale.append(query_plan.proxy_note)
-        return AnswerContext(
-            ranked=ranked,
-            question_type="generic",
-            candidate_mode="ranked",
-            summary=f"Candidates ranked by {query_plan.metric_label}.",
-            rationale=rationale,
+        database: Any,
+        *,
+        selected_site_id: str | None,
+        visible_site_ids: Sequence[str] | None,
+    ) -> str:
+        llm = self._get_llm()
+        toolkit = ReadOnlySQLDatabaseToolkit(db=database, llm=llm)
+        agent_executor = create_sql_agent(
+            llm=llm,
+            toolkit=toolkit,
+            agent_type="tool-calling",
+            prefix=self._build_agent_prefix(selected_site_id, visible_site_ids),
+            suffix=self._build_agent_suffix(),
+            top_k=DEFAULT_SQL_TOP_K,
+            max_iterations=10,
+            verbose=False,
+            agent_executor_kwargs={"handle_parsing_errors": True},
         )
-
-    def _build_area_pressure_context(self, query_plan: QueryPlan) -> AnswerContext:
-        history = self._get_history_subset(query_plan.frame)
-        if history.empty or "productionarea" not in history.columns:
-            return self._build_generic_context(query_plan)
-
-        history = history.dropna(subset=["week_start_date", "productionarea"]).copy()
-        if history.empty:
-            return self._build_generic_context(query_plan)
-
-        latest = history["week_start_date"].max()
-        current_cutoff = latest - pd.Timedelta(weeks=4)
-        previous_cutoff = latest - pd.Timedelta(weeks=8)
-
-        current = history[history["week_start_date"] > current_cutoff].copy()
-        previous = history[
-            (history["week_start_date"] <= current_cutoff)
-            & (history["week_start_date"] > previous_cutoff)
-        ].copy()
-        if current.empty:
-            return self._build_generic_context(query_plan)
-
-        current_group = current.groupby("productionarea").agg(
-            current_ratio=("femaleadult_to_limit_ratio", "mean"),
-            current_breach_rate=("breach_this_week", "mean"),
-            active_sites=("site_id", pd.Series.nunique),
+        result = agent_executor.invoke(
+            {"input": self._build_agent_input(message, selected_site_id, visible_site_ids)}
         )
-        previous_group = previous.groupby("productionarea").agg(
-            previous_ratio=("femaleadult_to_limit_ratio", "mean"),
-            previous_breach_rate=("breach_this_week", "mean"),
-        )
-        summary = current_group.join(previous_group, how="left").fillna(0.0)
-        summary["ratio_change"] = summary["current_ratio"] - summary["previous_ratio"]
-        summary["breach_change"] = (
-            summary["current_breach_rate"] - summary["previous_breach_rate"]
-        )
-        summary = summary.sort_values(
-            ["ratio_change", "breach_change", "current_ratio"],
-            ascending=[False, False, False],
-        )
+        output = result.get("output") if isinstance(result, dict) else None
+        if not isinstance(output, str) or not output.strip():
+            raise RuntimeError("SQL agent returned no answer text")
+        return output.strip()
 
-        supporting_rows = [
-            {
-                "label": area,
-                "detail": (
-                    f"Current ratio {_format_ratio(row.current_ratio)} versus {_format_ratio(row.previous_ratio)} "
-                    f"({_format_signed_ratio(row.ratio_change)}); breach rate {_format_percent(row.current_breach_rate)} "
-                    f"versus {_format_percent(row.previous_breach_rate)}; {int(row.active_sites)} active site(s)."
-                ),
-            }
-            for area, row in summary.head(5).iterrows()
-        ]
-        top_areas = list(summary.head(max(3, query_plan.top_n)).index)
-        ranked = self._rank_snapshot_subset(
-            query_plan.frame[query_plan.frame["productionarea"].isin(top_areas)].copy(),
-            metric_key="near_term_risk",
-            top_n=query_plan.top_n,
-        )
-        answer_areas = ", ".join(top_areas[:3]) if top_areas else "the visible production areas"
-        return AnswerContext(
-            ranked=ranked,
-            question_type="area_pressure",
-            candidate_mode="area-ranking",
-            summary=f"The clearest current increase in lice pressure is in {answer_areas}.",
-            rationale=[
-                "This compares the last 4 weeks with the previous 4 weeks.",
-                "Ranking uses the change in mean female-adult-to-limit ratio, with breach rate change as a tie-breaker.",
-            ],
-            supporting_title="Production Areas",
-            supporting_rows=supporting_rows,
-            window_note="Last 4 weeks versus the previous 4 weeks.",
-        )
-
-    def _build_repeated_breach_context(self, query_plan: QueryPlan) -> AnswerContext:
-        history = self._get_history_subset(query_plan.frame)
-        if history.empty:
-            return self._build_generic_context(query_plan)
-
-        history = history.dropna(subset=["week_start_date", "site_id"]).copy()
-        if history.empty:
-            return self._build_generic_context(query_plan)
-
-        latest = history["week_start_date"].max()
-        window = history[history["week_start_date"] > latest - pd.Timedelta(weeks=52)].copy()
-        if window.empty:
-            return self._build_generic_context(query_plan)
-
-        window = window.sort_values(["site_id", "week_start_date"]).copy()
-        window["breach_flag"] = window["breach_this_week"].fillna(False).astype(int)
-        window["previous_breach_flag"] = (
-            window.groupby("site_id")["breach_flag"].shift(1).fillna(0).astype(int)
-        )
-        window["breach_episode_start"] = (
-            (window["breach_flag"] == 1) & (window["previous_breach_flag"] == 0)
-        ).astype(int)
-
-        summary = (
-            window.groupby(["site_id", "site_label", "productionarea"]).agg(
-                breach_weeks=("breach_flag", "sum"),
-                breach_episodes=("breach_episode_start", "sum"),
-                peak_ratio=("femaleadult_to_limit_ratio", "max"),
-            )
-        ).reset_index()
-        summary = summary[summary["breach_weeks"] > 0].sort_values(
-            ["breach_weeks", "breach_episodes", "peak_ratio"],
-            ascending=[False, False, False],
-        )
-        if summary.empty:
-            return AnswerContext(
-                ranked=query_plan.frame.head(0),
-                question_type="repeated_breaches",
-                candidate_mode="no-repeats",
-                summary="No visible sites show repeated breaches in the last 52 weeks.",
-                rationale=[
-                    "The historical check looked for breach weeks in the last 52 weeks of the visible population.",
-                    "Consecutive breach weeks were collapsed into a single episode when they belonged to the same run.",
-                ],
-                supporting_title="Repeated-Breach Sites",
-                supporting_rows=[],
-                window_note="Last 52 weeks.",
-            )
-
-        supporting_rows = [
-            {
-                "label": f"{row.site_label} ({row.productionarea})",
-                "detail": (
-                    f"{int(row.breach_weeks)} breach week(s) across {int(row.breach_episodes)} separate episode(s) "
-                    f"in the last 52 weeks; peak ratio {_format_ratio(row.peak_ratio)}."
-                ),
-            }
-            for _, row in summary.head(5).iterrows()
-        ]
-        top_site_ids = summary["site_id"].head(query_plan.top_n).tolist()
-        ranked = self._ordered_snapshot_subset(query_plan.frame, top_site_ids)
-        lead = summary.iloc[0]
-        return AnswerContext(
-            ranked=ranked,
-            question_type="repeated_breaches",
-            candidate_mode="site-history",
-            summary=(
-                f"{lead.site_label} in {lead.productionarea} shows the strongest repeated-breach pattern in the visible population."
-            ),
-            rationale=[
-                "The ranking uses breach weeks in the last 52 weeks.",
-                "Consecutive breach weeks count as one episode when they are part of the same run.",
-            ],
-            supporting_title="Repeated-Breach Sites",
-            supporting_rows=supporting_rows,
-            window_note="Last 52 weeks.",
-        )
-
-    def _build_treatment_intensity_context(self, query_plan: QueryPlan) -> AnswerContext:
-        history = self._get_history_subset(query_plan.frame)
-        if history.empty or "productionarea" not in history.columns:
-            return self._build_generic_context(query_plan)
-
-        history = history.dropna(subset=["week_start_date", "productionarea"]).copy()
-        if history.empty:
-            return self._build_generic_context(query_plan)
-
-        latest = history["week_start_date"].max()
-        window = history[history["week_start_date"] > latest - pd.Timedelta(weeks=12)].copy()
-        if window.empty:
-            return self._build_generic_context(query_plan)
-
-        summary = window.groupby("productionarea").agg(
-            treatment_count=("treatment_count", "sum"),
-            active_site_weeks=("site_id", "count"),
-            treated_weeks=("any_treatment", "sum"),
-        )
-        summary["treatment_intensity"] = (
-            summary["treatment_count"] / summary["active_site_weeks"].replace(0, np.nan)
-        )
-        summary["treated_share"] = (
-            summary["treated_weeks"] / summary["active_site_weeks"].replace(0, np.nan)
-        )
-        summary = summary.fillna(0.0).sort_values(
-            ["treatment_intensity", "treated_share", "treatment_count"],
-            ascending=[False, False, False],
-        )
-
-        supporting_rows = [
-            {
-                "label": area,
-                "detail": (
-                    f"{_format_decimal(row.treatment_intensity, 3)} treatment event(s) per active site-week in the last 12 weeks; "
-                    f"treated-share {_format_percent(row.treated_share)}; {int(round(row.treatment_count))} total treatments."
-                ),
-            }
-            for area, row in summary.head(5).iterrows()
-        ]
-        top_areas = list(summary.head(max(3, query_plan.top_n)).index)
-        snapshot = query_plan.frame[query_plan.frame["productionarea"].isin(top_areas)].copy()
-        if "weeks_since_any_treatment" in snapshot.columns:
-            recent_snapshot = snapshot[
-                snapshot["weeks_since_any_treatment"].fillna(np.inf) <= 4
-            ].copy()
-            if not recent_snapshot.empty:
-                snapshot = recent_snapshot
-        ranked = self._rank_snapshot_subset(
-            snapshot,
-            metric_key="near_term_risk",
-            top_n=query_plan.top_n,
-        )
-        answer_areas = ", ".join(top_areas[:3]) if top_areas else "the visible production areas"
-        return AnswerContext(
-            ranked=ranked,
-            question_type="treatment_intensity_area",
-            candidate_mode="area-ranking",
-            summary=f"The highest recent treatment intensity is in {answer_areas}.",
-            rationale=[
-                "Treatment intensity is total treatment events per active site-week.",
-                "Treated-share is the share of active site-weeks with any treatment in the same 12-week window.",
-            ],
-            supporting_title="Production Areas",
-            supporting_rows=supporting_rows,
-            window_note="Last 12 weeks.",
-        )
-
-    def _build_pre_breach_pattern_context(self, query_plan: QueryPlan) -> AnswerContext:
-        history = self._get_history_subset(query_plan.frame)
-        if history.empty:
-            return self._build_generic_context(query_plan)
-
-        history = history.dropna(subset=["week_start_date", "site_id"]).copy()
-        history = history.sort_values(["site_id", "week_start_date"]).copy()
-        if history.empty:
-            return self._build_generic_context(query_plan)
-
-        history["next_breach"] = history.groupby("site_id")["breach_this_week"].shift(-1)
-        baseline = history[history["havecountedlice"].fillna(False)].copy()
-        pre_breach = baseline[baseline["next_breach"].fillna(False)].copy()
-        if pre_breach.empty or baseline.empty:
-            return self._build_generic_context(query_plan)
-
-        supporting_rows: list[dict[str, object]] = []
-        for label, column, formatter in [
-            ("Female-adult-to-limit ratio", "femaleadult_to_limit_ratio", "ratio"),
-            (
-                "Neighbor limit ratio lag 1",
-                "neighbor_femaleadult_to_limit_ratio_lag1",
-                "ratio",
-            ),
-            ("Production-area breach rate lag 1", "pa_breach_rate_lag1", "percent"),
-            ("Treatments in prior 4 weeks", "any_treatment_roll4_sum", "count"),
-        ]:
-            if column not in pre_breach.columns or column not in baseline.columns:
-                continue
-            pre_mean = pre_breach[column].mean()
-            baseline_mean = baseline[column].mean()
-            if pd.isna(pre_mean) or pd.isna(baseline_mean):
-                continue
-            supporting_rows.append(
-                {
-                    "label": label,
-                    "detail": _format_pattern_detail(
-                        pre_mean,
-                        baseline_mean,
-                        formatter,
-                    ),
-                }
-            )
-
-        summary = (
-            "Before breaches, sites usually already show a much higher lice-to-limit ratio and stronger surrounding pressure."
-            if supporting_rows
-            else "The visible history does not show a stable pre-breach pattern summary."
-        )
-        return AnswerContext(
-            ranked=query_plan.frame.head(0),
-            question_type="pre_breach_patterns",
-            candidate_mode="pattern-summary",
-            summary=summary,
-            rationale=[
-                "Pre-breach rows are site-weeks whose next observed week is a breach.",
-                "The baseline uses counted site-weeks in the same visible population so the comparison stays local.",
-            ],
-            supporting_title="Observed Patterns",
-            supporting_rows=supporting_rows,
-            window_note="Across the available historical record in the current visible population.",
-        )
-
-    def _build_generic_context(self, query_plan: QueryPlan) -> AnswerContext:
-        ranked = self._rank_sites(query_plan)
-        rationale: list[str] = [f"Candidates are ranked by {query_plan.metric_label}."]
-        if query_plan.filters_applied:
-            rationale.append(
-                f"Active filters: {', '.join(query_plan.filters_applied)}."
-            )
-        if query_plan.proxy_note:
-            rationale.append(query_plan.proxy_note)
-        return AnswerContext(
-            ranked=ranked,
-            question_type="generic",
-            candidate_mode="ranked",
-            summary=f"Candidates ranked by {query_plan.metric_label}.",
-            rationale=rationale,
-        )
-
-    def _get_history_subset(self, snapshot_frame: pd.DataFrame) -> pd.DataFrame:
-        history = self._cached_history_frame
-        if history is None or history.empty or snapshot_frame.empty:
-            return pd.DataFrame()
-
-        if "site_id" not in snapshot_frame.columns:
-            return pd.DataFrame()
-
-        site_ids = snapshot_frame["site_id"].dropna().astype(str).unique().tolist()
-        if not site_ids:
-            return pd.DataFrame()
-        return history[history["site_id"].isin(site_ids)].copy()
-
-    def _rank_snapshot_subset(
+    def _build_agent_prefix(
         self,
-        frame: pd.DataFrame,
-        metric_key: str,
-        top_n: int,
-    ) -> pd.DataFrame:
-        if frame.empty:
-            return frame
-
-        working = frame.copy()
-        sort_columns: list[str] = []
-        ascending: list[bool] = []
-        if metric_key in working.columns and working[metric_key].notna().any():
-            working = working[working[metric_key].notna()].copy()
-            sort_columns.append(metric_key)
-            ascending.append(False)
-
-        for column in ["femaleadult_to_limit_ratio", "classifier_12w_score", "near_term_risk"]:
-            if column in working.columns and column not in sort_columns:
-                sort_columns.append(column)
-                ascending.append(False)
-
-        sort_columns.append("site_label")
-        ascending.append(True)
-        if working.empty:
-            return working
-        return working.sort_values(sort_columns, ascending=ascending).head(top_n).reset_index(
-            drop=True
+        selected_site_id: str | None,
+        visible_site_ids: Sequence[str] | None,
+    ) -> str:
+        scope_description = self._describe_visible_scope(visible_site_ids)
+        cutoff_text = (
+            self._case_cutoff_date.date().isoformat()
+            if self._case_cutoff_date is not None
+            else "the validated pre-2026 case window"
         )
-
-    def _ordered_snapshot_subset(
-        self,
-        frame: pd.DataFrame,
-        site_ids: list[str],
-    ) -> pd.DataFrame:
-        if frame.empty or not site_ids:
-            return frame.head(0)
-
-        order = {str(site_id): index for index, site_id in enumerate(site_ids)}
-        working = frame[frame["site_id"].isin(order)].copy()
-        if working.empty:
-            return working
-        working["__order"] = working["site_id"].map(order)
+        selected_site_text = selected_site_id or "none"
         return (
-            working.sort_values("__order")
-            .drop(columns="__order")
-            .reset_index(drop=True)
+            "You are an expert aquaculture analyst for Mowi. "
+            "You are designed to interact with a SQL database that contains aquaculture observations and forecasts. "
+            "Base every claim strictly on the database results you retrieve. If the data does not support a claim, say so rather than guessing.\n\n"
+            "Given an input question, create a syntactically correct {dialect} query to run, then look at the results of the query and return the answer. "
+            "Unless the user specifies a specific number of examples they wish to obtain, always limit your query to at most {top_k} rows. "
+            "You can order the results by a relevant column to return the most useful examples. "
+            "Never query for every column from a table; ask only for the columns needed to answer the question.\n\n"
+            "You have access to tools for interacting with the database. Only use those tools. "
+            "You MUST use the SQL checker tool before executing a query. If a query returns an error, rewrite it and try again.\n\n"
+            "Security and scope rules:\n"
+            "- The database is read-only. Never attempt INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, COPY, EXPORT, ATTACH, DETACH, INSTALL, LOAD, SET, PRAGMA, or any other write or admin statement.\n"
+            f"- The default request scope is: {scope_description}.\n"
+            "- Use visible_master_table by default for map-scoped questions. Use master_table only when the user explicitly asks for all sites, nationwide analysis, or broader history than the current map scope.\n"
+            f"- Selected site on the map: {selected_site_text}.\n"
+            f"- Case cutoff: {cutoff_text}. Treat any data after that cutoff as out of scope.\n\n"
+            "When you are done, your final answer MUST be a valid JSON object with this exact shape: "
+            '{{"answer":"...","sitenumbers":["12345","67890"]}}.\n'
+            "- The answer field must contain the user-facing answer text.\n"
+            "- The sitenumbers field must contain only relevant sitenumber values from the database, converted to strings. Use an empty list when no sites are relevant.\n"
+            "- Do not wrap the final JSON in code fences.\n"
+            "- If the question is unrelated to the database, return JSON with answer set to \"I don't know\" and an empty sitenumbers list."
         )
 
-    def _sort_limit_candidates(self, frame: pd.DataFrame) -> pd.DataFrame:
-        working = frame.copy()
-        sort_columns: list[str] = []
-        ascending: list[bool] = []
-        for column in ["femaleadult_to_limit_ratio", "femaleadult"]:
-            if column in working.columns:
-                working = working[working[column].notna()].copy()
-                sort_columns.append(column)
-                ascending.append(False)
-        sort_columns.append("site_label")
-        ascending.append(True)
-        if working.empty:
-            return working
-        return working.sort_values(sort_columns, ascending=ascending).reset_index(
-            drop=True
+    def _build_agent_suffix(self) -> str:
+        return (
+            "I should list the tables first, inspect the schema for the relevant tables, "
+            "double-check any query before execution, and then return only the final JSON object."
         )
 
-    def _rank_sites(self, query_plan: QueryPlan) -> pd.DataFrame:
-        working = query_plan.frame.copy()
-        metric_key = query_plan.metric_key
-        if metric_key not in working.columns:
-            return working.head(0)
+    def _build_agent_input(
+        self,
+        message: str,
+        selected_site_id: str | None,
+        visible_site_ids: Sequence[str] | None,
+    ) -> str:
+        parts = [f"User question: {message}"]
+        if selected_site_id:
+            parts.append(f"Selected site on map: {selected_site_id}")
+        if visible_site_ids is not None:
+            parts.append(
+                f"Visible map site count: {len(_normalize_site_ids(visible_site_ids))}"
+            )
+        parts.append("Return only the final JSON object when you have enough information.")
+        return "\n".join(parts)
 
-        working = working[working[metric_key].notna()].copy()
-        if working.empty:
-            return working
+    def _get_llm(self) -> Any:
+        if (
+            ChatVertexAI is None
+            or create_sql_agent is None
+            or SQLDatabase is None
+            or ReadOnlySQLDatabaseToolkit is None
+        ):
+            raise RuntimeError(
+                "LangChain SQL agent dependencies are not installed in this environment"
+            )
 
-        tie_breaker_columns = [
-            column
-            for column in [
-                "femaleadult_to_limit_ratio",
-                "classifier_12w_score",
-                "count_12w_prediction",
-            ]
-            if column in working.columns
-        ]
-        sort_columns = [metric_key, *tie_breaker_columns, "site_label"]
-        ascending = [not query_plan.descending] * (len(sort_columns) - 1) + [True]
-        return working.sort_values(sort_columns, ascending=ascending).reset_index(
-            drop=True
+        project = os.getenv("GOOGLE_CLOUD_PROJECT")
+        location = os.getenv("GOOGLE_CLOUD_LOCATION")
+        model_name = os.getenv("VERTEX_GEMINI_MODEL", DEFAULT_CHAT_MODEL)
+        if not project or not location:
+            raise RuntimeError(
+                "Missing GOOGLE_CLOUD_PROJECT or GOOGLE_CLOUD_LOCATION in the process environment"
+            )
+
+        config = (project, location, model_name)
+        if self._cached_llm is None or self._cached_llm_config != config:
+            self._cached_llm = ChatVertexAI(
+                model=model_name,
+                project=project,
+                location=location,
+                temperature=0,
+                max_retries=3,
+            )
+            self._cached_llm_config = config
+            self._cached_extractor = None
+        return self._cached_llm
+
+    def _get_output_extractor(self) -> Any:
+        if self._cached_extractor is None:
+            self._cached_extractor = self._get_llm().with_structured_output(
+                AgentResultPayload
+            )
+        return self._cached_extractor
+
+    def _parse_agent_result(self, message: str, raw_output: str) -> AgentResultPayload:
+        parsed_payload = _load_json_like_payload(raw_output)
+        if parsed_payload is not None:
+            return _coerce_agent_payload(parsed_payload, raw_output)
+
+        try:
+            extracted = self._get_output_extractor().invoke(
+                "Extract the final user-facing answer and relevant sitenumbers from the SQL agent output below. "
+                "Only include sitenumbers that are explicitly supported by the output.\n\n"
+                f"User question:\n{message}\n\n"
+                f"SQL agent output:\n{raw_output}"
+            )
+            return _coerce_agent_payload(extracted, raw_output)
+        except Exception:
+            answer = raw_output.strip() or "I couldn't produce a usable answer."
+            return AgentResultPayload(answer=answer, sitenumbers=[])
+
+    def _hydrate_sites(self, sitenumbers: Sequence[str]) -> list[dict[str, object]]:
+        if self._cached_site_index is None or self._cached_site_index.empty:
+            return []
+
+        site_cards: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for site_id in _normalize_site_ids(sitenumbers):
+            if site_id in seen or site_id not in self._cached_site_index.index:
+                continue
+            row = self._cached_site_index.loc[site_id]
+            if isinstance(row, pd.DataFrame):
+                row = row.iloc[0]
+            site_cards.append(self._serialize_site(row, DEFAULT_SITE_CARD_METRIC))
+            seen.add(site_id)
+        return site_cards
+
+    def _build_scope_notes(
+        self,
+        selected_site_id: str | None,
+        visible_site_ids: Sequence[str] | None,
+    ) -> list[str]:
+        notes: list[str] = []
+        if visible_site_ids is None:
+            notes.append("map scope: full dataset")
+        else:
+            visible_count = len(_normalize_site_ids(visible_site_ids))
+            if visible_count:
+                notes.append(f"map scope: {visible_count} visible site(s)")
+            else:
+                notes.append("map scope: no visible sites")
+        if selected_site_id:
+            notes.append(f"selected site: {selected_site_id}")
+        return notes
+
+    def _build_scope_note(self, visible_site_ids: Sequence[str] | None) -> str | None:
+        if visible_site_ids is None:
+            return None
+        visible_count = len(_normalize_site_ids(visible_site_ids))
+        if visible_count:
+            return (
+                "SQL chat defaults to visible_master_table for the current map scope. "
+                "Ask explicitly for all sites to broaden the query."
+            )
+        return (
+            "The current map scope has no visible sites, so visible_master_table is empty unless the question explicitly asks for all sites."
         )
+
+    def _describe_visible_scope(self, visible_site_ids: Sequence[str] | None) -> str:
+        if visible_site_ids is None:
+            return (
+                "no explicit visible-site subset was provided, so visible_master_table mirrors master_table"
+            )
+        visible_count = len(_normalize_site_ids(visible_site_ids))
+        if visible_count:
+            return f"visible_master_table contains {visible_count} visible site(s) from the current map state"
+        return "visible_master_table is empty because the current map state has no visible sites"
+
+    def _build_failure_response(
+        self,
+        answer: str,
+        *,
+        selected_site_id: str | None,
+        visible_site_ids: Sequence[str] | None,
+    ) -> dict[str, object]:
+        return {
+            "answer": answer,
+            "used_llm": False,
+            "metric_key": DEFAULT_SITE_CARD_METRIC,
+            "metric_label": "current snapshot context",
+            "filters_applied": self._build_scope_notes(
+                selected_site_id, visible_site_ids
+            ),
+            "proxy_note": self._build_scope_note(visible_site_ids),
+            "sites": [],
+            "llm": self.get_llm_status(),
+        }
 
     def _serialize_site(self, row: pd.Series, metric_key: str) -> dict[str, object]:
         metric_value = row.get(metric_key)
@@ -955,239 +719,162 @@ class SiteChatService:
             "count_1w_prediction": _jsonify(row.get("count_1w_prediction")),
             "count_2w_prediction": _jsonify(row.get("count_2w_prediction")),
             "count_12w_prediction": _jsonify(row.get("count_12w_prediction")),
-            "latest_observation_date": _jsonify(row.get("latest_observation_date")),
-            "last_treatment_date": _jsonify(row.get("last_treatment_date")),
+            "year": _jsonify(row.get("year")),
+            "week": _jsonify(row.get("week")),
+            "latest_reporting_week_label": _jsonify(
+                row.get("latest_reporting_week_label")
+            ),
+            "last_treatment_week_label": _jsonify(
+                row.get("last_treatment_week_label")
+            ),
             "last_treatment_action": _jsonify(row.get("last_treatment_action")),
             "last_treatment_activeingredient": _jsonify(
                 row.get("last_treatment_activeingredient")
             ),
         }
 
-    def _generate_answer(
-        self,
-        message: str,
-        query_plan: QueryPlan,
-        answer_context: AnswerContext,
-        site_cards: list[dict[str, object]],
-        selected_site: dict[str, object] | None,
-    ) -> tuple[str, bool]:
-        prompt_payload = {
-            "question": message,
-            "metric_label": query_plan.metric_label,
-            "filters_applied": query_plan.filters_applied,
-            "proxy_note": query_plan.proxy_note,
-            "answer_context": {
-                "question_type": answer_context.question_type,
-                "candidate_mode": answer_context.candidate_mode,
-                "summary": answer_context.summary,
-                "rationale": answer_context.rationale,
-                "exact_match_count": answer_context.exact_match_count,
-                "supporting_title": answer_context.supporting_title,
-                "supporting_rows": answer_context.supporting_rows,
-                "window_note": answer_context.window_note,
-            },
-            "selected_site": selected_site,
-            "candidate_sites": site_cards,
-        }
-        llm_answer = self._call_gemini(prompt_payload)
-        if llm_answer:
-            return llm_answer, True
-        return self._fallback_answer(query_plan, answer_context, site_cards), False
 
-    def _call_gemini(self, prompt_payload: dict[str, object]) -> str | None:
-        self._last_llm_error = None
-        project = os.getenv("GOOGLE_CLOUD_PROJECT")
-        location = os.getenv("GOOGLE_CLOUD_LOCATION")
-        model_name = os.getenv("VERTEX_GEMINI_MODEL", DEFAULT_CHAT_MODEL)
-        if genai is None:
-            self._last_llm_error = "google-genai is not installed"
-            return None
-        if not project or not location:
-            self._last_llm_error = "Missing GOOGLE_CLOUD_PROJECT or GOOGLE_CLOUD_LOCATION in the process environment"
-            return None
+def _validate_read_only_query(query: str) -> str | None:
+    stripped = _strip_sql_comments(query).strip()
+    if not stripped:
+        return "Query was empty."
 
-        if self._cached_client is None:
-            self._cached_client = genai.Client(
-                vertexai=True,
-                project=project,
-                location=location,
-            )
+    compact = stripped.rstrip().rstrip(";").strip()
+    if ";" in compact:
+        return "Only a single SQL statement is allowed."
 
-        prompt = (
-            "You are an operational forecasting assistant for a salmon farming company. "
-            "Answer only from the provided site data. Think through the exact question before you answer. "
-            "Use Markdown. Start with **Answer** and give the direct answer first. Then add **Why** with short bullets. "
-            "Prefer the structured answer_context over guessing from candidate_sites. "
-            "If answer_context.question_type refers to production areas, answer in terms of production areas rather than sites. "
-            "If answer_context.question_type is pre_breach_patterns, describe patterns only and do not invent causal claims. "
-            "If answer_context.candidate_mode is near-misses, explicitly say there are no exact matches and then add **Closest sites** explaining that they are nearest alternatives, not exact matches. "
-            "If answer_context.candidate_mode is exact-matches, only describe the exact matching sites. "
-            "When ranking sites, mention coordinates and the metric used. If the request uses a proxy horizon, explain that briefly. If supporting_rows are present, summarize them directly and keep the wording faithful to the provided numbers.\n\n"
-            f"Context:\n{json.dumps(prompt_payload, ensure_ascii=False, indent=2)}"
+    normalized = re.sub(r"\s+", " ", compact.lower())
+    leading_match = re.match(r"^([a-z_]+)", normalized)
+    if leading_match is None:
+        return "Only a read-only SELECT or WITH query is allowed."
+
+    leading_keyword = leading_match.group(1)
+    if leading_keyword not in READ_ONLY_ALLOWED_LEADING_KEYWORDS:
+        return "Only a read-only SELECT or WITH query is allowed."
+
+    blocked_keyword_pattern = r"\b(" + "|".join(sorted(READ_ONLY_BLOCKED_KEYWORDS)) + r")\b"
+    blocked_keyword = re.search(blocked_keyword_pattern, normalized)
+    if blocked_keyword is not None:
+        return f"The query contains a blocked keyword: {blocked_keyword.group(1)}."
+
+    blocked_function_pattern = r"\b(" + "|".join(sorted(READ_ONLY_BLOCKED_FUNCTIONS)) + r")\s*\("
+    blocked_function = re.search(blocked_function_pattern, normalized)
+    if blocked_function is not None:
+        return f"The query contains a blocked function: {blocked_function.group(1)}."
+
+    allowed_relations = {"master_table", "visible_master_table"}
+    cte_normalized = normalized.replace("with recursive ", "with ")
+    cte_names = {
+        match.group(1)
+        for match in re.finditer(
+            r"(?:with|,)\s*([a-z_][\w]*)\s+as\s*\(", cte_normalized
         )
+    }
+    allowed_relations.update(cte_names)
+
+    for token in re.findall(r"\b(?:from|join)\s+([^\s,]+)", normalized):
+        candidate = token.strip().rstrip(")").rstrip(";")
+        if not candidate or candidate.startswith("("):
+            continue
+        relation_name = candidate.split(".")[-1].strip('"')
+        if relation_name not in allowed_relations:
+            return (
+                "Queries may only read from the master_table or visible_master_table views."
+            )
+
+    return None
+
+
+def _strip_sql_comments(query: str) -> str:
+    without_block_comments = re.sub(r"/\*.*?\*/", " ", query, flags=re.S)
+    return re.sub(r"--.*?$", " ", without_block_comments, flags=re.M)
+
+
+def _load_json_like_payload(text: str) -> dict[str, Any] | None:
+    candidates = [text.strip()]
+    candidates.extend(
+        match.strip()
+        for match in re.findall(r"```(?:json)?\s*(.*?)```", text, flags=re.I | re.S)
+        if match.strip()
+    )
+
+    first_brace = text.find("{")
+    last_brace = text.rfind("}")
+    if first_brace != -1 and last_brace > first_brace:
+        candidates.append(text[first_brace : last_brace + 1].strip())
+
+    for candidate in candidates:
+        if not candidate:
+            continue
         try:
-            response = self._cached_client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-            )
-        except Exception as exc:
-            self._last_llm_error = _truncate_error(exc)
-            return None
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
 
-        text = getattr(response, "text", None)
-        if not text:
-            self._last_llm_error = "Vertex response did not include response.text"
-            return None
-        return text.strip()
 
-    def _fallback_answer(
-        self,
-        query_plan: QueryPlan,
-        answer_context: AnswerContext,
-        site_cards: list[dict[str, object]],
-    ) -> str:
-        if not site_cards and not answer_context.supporting_rows:
-            return "**Answer**\n\nNo candidate sites were available after applying the current filters."
+def _coerce_agent_payload(payload: Any, raw_output: str) -> AgentResultPayload:
+    if isinstance(payload, AgentResultPayload):
+        return AgentResultPayload(
+            answer=payload.answer.strip(),
+            sitenumbers=_normalize_site_ids(payload.sitenumbers),
+        )
 
-        lines: list[str] = ["**Answer**"]
+    if isinstance(payload, BaseModel):
+        data = payload.model_dump()
+    elif isinstance(payload, dict):
+        data = payload
+    else:
+        data = {}
 
-        if answer_context.question_type == "current_limit_status":
-            if answer_context.candidate_mode == "exact-matches":
-                lines.append(
-                    f"{answer_context.exact_match_count} visible site(s) are already above the lice limit."
+    answer = str(data.get("answer") or raw_output or "").strip()
+    if not answer:
+        answer = "I couldn't produce a usable answer."
+
+    sitenumber_values = data.get("sitenumbers")
+    if sitenumber_values is None:
+        sitenumber_values = data.get("sites")
+
+    coerced_sitenumbers: list[str] = []
+    if isinstance(sitenumber_values, list):
+        for value in sitenumber_values:
+            if isinstance(value, dict):
+                site_value = (
+                    value.get("sitenumber")
+                    or value.get("site_id")
+                    or value.get("site")
                 )
-                section_title = "**Matching sites**"
-            else:
-                lines.append("No visible sites are currently above the lice limit.")
-                section_title = "**Closest sites**"
-        elif answer_context.question_type in {
-            "area_pressure",
-            "repeated_breaches",
-            "treatment_intensity_area",
-            "pre_breach_patterns",
-        }:
-            lines.append(answer_context.summary)
-            section_title = (
-                f"**{answer_context.supporting_title}**"
-                if answer_context.supporting_title
-                else "**Supporting detail**"
-            )
-        else:
-            lead = site_cards[0]
-            lines.append(
-                f"Top match by {query_plan.metric_label}: {lead['sitename']} in {lead['productionarea']} at {lead['metric_display']}."
-            )
-            section_title = "**Top sites**"
+                if site_value is not None:
+                    coerced_sitenumbers.append(str(site_value))
+            elif value is not None:
+                coerced_sitenumbers.append(str(value))
+    elif sitenumber_values is not None:
+        coerced_sitenumbers.append(str(sitenumber_values))
 
-        lines.extend(["", "**Why**"])
-        for reason in answer_context.rationale:
-            lines.append(f"- {reason}")
-        if answer_context.window_note:
-            lines.append(f"- Window: {answer_context.window_note}")
-        if query_plan.filters_applied and answer_context.question_type != "generic":
-            lines.append(f"- Active filters: {', '.join(query_plan.filters_applied)}.")
-        if query_plan.proxy_note and query_plan.proxy_note not in answer_context.rationale:
-            lines.append(f"- {query_plan.proxy_note}")
-
-        lines.extend(["", section_title])
-        if answer_context.supporting_rows:
-            for index, row in enumerate(
-                answer_context.supporting_rows[: min(5, len(answer_context.supporting_rows))],
-                start=1,
-            ):
-                lines.append(f"{index}. **{row['label']}** - {row['detail']}")
-        else:
-            for index, site in enumerate(site_cards[: min(5, len(site_cards))], start=1):
-                lines.append(
-                    f"{index}. **{site['sitename']}** ({site['productionarea']}) - {site['metric_display']} at {site['coordinates_text']}"
-                )
-        return "\n".join(lines)
-
-    def _match_named_values(self, query: str, series: pd.Series | None) -> list[str]:
-        if series is None:
-            return []
-        values = [
-            value
-            for value in series.dropna().astype(str).unique().tolist()
-            if value.strip()
-        ]
-        matches: list[str] = []
-        for value in values:
-            normalized = _normalize_text(value)
-            if normalized and normalized in query:
-                matches.append(value)
-        return matches
-
-
-def _contains_any(query: str, candidates: list[str]) -> bool:
-    return any(candidate in query for candidate in candidates)
-
-
-def _is_current_limit_query(query: str) -> bool:
-    return _contains_any(
-        query,
-        [
-            "over limit",
-            "above limit",
-            "lice limit",
-            "weekly threshold",
-            "current limit",
-        ],
+    return AgentResultPayload(
+        answer=answer,
+        sitenumbers=_normalize_site_ids(coerced_sitenumbers),
     )
 
 
-def _detect_question_type(query: str) -> str:
-    if _is_current_limit_query(query):
-        return "current_limit_status"
-    if _contains_any(
-        query,
-        [
-            "increasing lice pressure",
-            "increasing pressure",
-            "areas currently show increasing",
-            "show increasing lice pressure",
-        ],
-    ):
-        return "area_pressure"
-    if _contains_any(
-        query,
-        [
-            "repeated breaches",
-            "repeated breach",
-            "breached repeatedly",
-            "repeat breaches",
-        ],
-    ):
-        return "repeated_breaches"
-    if _contains_any(
-        query,
-        [
-            "treatment intensity",
-            "highest treatment intensity",
-            "most treatment intensity",
-            "most treated production areas",
-        ],
-    ):
-        return "treatment_intensity_area"
-    if _contains_any(
-        query,
-        [
-            "patterns before breaches",
-            "before breaches occur",
-            "before breaches",
-            "pre breach",
-            "pre-breach",
-        ],
-    ):
-        return "pre_breach_patterns"
-    return "generic"
+def _normalize_site_ids(values: Sequence[str] | None) -> list[str]:
+    if values is None:
+        return []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        site_id = str(value or "").strip()
+        if not site_id or site_id in seen:
+            continue
+        normalized.append(site_id)
+        seen.add(site_id)
+    return normalized
 
 
-def _normalize_text(value: object) -> str:
-    text = unicodedata.normalize("NFKD", str(value or ""))
-    text = text.encode("ascii", "ignore").decode("ascii")
-    text = re.sub(r"[^a-zA-Z0-9]+", " ", text.lower())
-    return re.sub(r"\s+", " ", text).strip()
+def _quote_sql_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
 
 
 def _parse_case_cutoff_date(geojson: dict[str, object]) -> pd.Timestamp | None:
@@ -1226,75 +913,19 @@ def _format_metric_value(metric_key: str, value: object) -> str:
     return f"{numeric:.2f}"
 
 
-def _format_ratio(value: object) -> str:
-    numeric = _jsonify(value)
-    if numeric is None:
-        return "--"
-    return f"{float(numeric):.2f}x"
-
-
-def _format_signed_ratio(value: object) -> str:
-    numeric = _jsonify(value)
-    if numeric is None:
-        return "--"
-    return f"{float(numeric):+.2f}x"
-
-
-def _format_percent(value: object) -> str:
-    numeric = _jsonify(value)
-    if numeric is None:
-        return "--"
-    return f"{float(numeric) * 100:.1f}%"
-
-
-def _format_decimal(value: object, digits: int = 2) -> str:
-    numeric = _jsonify(value)
-    if numeric is None:
-        return "--"
-    return f"{float(numeric):.{digits}f}"
-
-
-def _format_pattern_detail(
-    pre_breach_value: object,
-    baseline_value: object,
-    formatter: str,
-) -> str:
-    pre_numeric = _jsonify(pre_breach_value)
-    baseline_numeric = _jsonify(baseline_value)
-    if pre_numeric is None or baseline_numeric is None:
-        return "No stable comparison was available."
-
-    if formatter == "ratio":
-        difference = float(pre_numeric) - float(baseline_numeric)
-        return (
-            f"{_format_ratio(pre_numeric)} before a breach versus {_format_ratio(baseline_numeric)} baseline "
-            f"({_format_signed_ratio(difference)})."
-        )
-
-    if formatter == "percent":
-        difference = float(pre_numeric) - float(baseline_numeric)
-        sign = "+" if difference >= 0 else "-"
-        return (
-            f"{_format_percent(pre_numeric)} before a breach versus {_format_percent(baseline_numeric)} baseline "
-            f"({sign}{abs(difference) * 100:.1f} pp)."
-        )
-
-    difference = float(pre_numeric) - float(baseline_numeric)
-    sign = "+" if difference >= 0 else "-"
-    return (
-        f"{_format_decimal(pre_numeric, 2)} before a breach versus {_format_decimal(baseline_numeric, 2)} baseline "
-        f"({sign}{abs(difference):.2f})."
-    )
-
-
 def _truncate_error(exc: Exception) -> str:
     message = f"{type(exc).__name__}: {exc}"
     return message if len(message) <= 400 else f"{message[:397]}..."
 
 
-def _jsonify(value: object):
-    if value is None or pd.isna(value):
+def _jsonify(value: object) -> object | None:
+    if value is None:
         return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
     if isinstance(value, np.integer):
         return int(value)
     if isinstance(value, np.floating):

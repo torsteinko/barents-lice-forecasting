@@ -38,6 +38,31 @@ const CHAT_SUGGESTIONS = [
   "Show me the highest 12-week risk sites that were treated recently.",
 ];
 
+const DEFAULT_LOCAL_API_ORIGIN = "http://127.0.0.1:8000";
+
+function resolveApiBase() {
+  const params = new URLSearchParams(window.location.search);
+  const explicitApiBase = params.get("api");
+  if (explicitApiBase) {
+    return explicitApiBase.replace(/\/+$/, "");
+  }
+
+  const isLocalHost = ["127.0.0.1", "localhost"].includes(window.location.hostname);
+  if (!isLocalHost) {
+    return "";
+  }
+  if (window.location.port === "8000") {
+    return "";
+  }
+  return DEFAULT_LOCAL_API_ORIGIN;
+}
+
+const API_BASE = resolveApiBase();
+
+function buildApiUrl(path) {
+  return API_BASE ? `${API_BASE}${path}` : path;
+}
+
 const state = {
   features: [],
   visible: [],
@@ -108,22 +133,8 @@ function formatPercent(value) {
   return `${Math.round(numeric * 100)}%`;
 }
 
-function formatDate(value) {
-  if (!value) {
-    return "--";
-  }
-  return String(value);
-}
-
-function formatCaseDate(value) {
-  if (!value) {
-    return "--";
-  }
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) {
-    return String(value);
-  }
-  return parsed.toISOString().slice(0, 10);
+function formatWeekLabel(value) {
+  return formatText(value);
 }
 
 function formatText(value) {
@@ -238,7 +249,7 @@ function normalizeFeature(feature) {
 }
 
 async function fetchSiteDataset() {
-  const endpoints = ["/api/sites", "../results/site_map.geojson"];
+  const endpoints = [buildApiUrl("/api/sites"), "../results/site_map.geojson"];
   for (const endpoint of endpoints) {
     try {
       const response = await fetch(endpoint);
@@ -254,10 +265,10 @@ async function fetchSiteDataset() {
 }
 
 function renderCaseDate() {
-  const caseDate = state.datasetMeta?.case_cutoff_date || null;
-  document.getElementById("case-date-value").textContent = formatCaseDate(caseDate);
-  document.getElementById("case-date-note").textContent = caseDate
-    ? `Everything shown here is capped at ${formatCaseDate(caseDate)}, not the real present day.`
+  const caseWeek = state.datasetMeta?.case_cutoff_week_label || null;
+  document.getElementById("case-date-value").textContent = formatWeekLabel(caseWeek);
+  document.getElementById("case-date-note").textContent = caseWeek
+    ? `Everything shown here is capped at reporting week ${formatWeekLabel(caseWeek)}, not the real present day.`
     : "All site status, treatment context, and answers are capped at the case cutoff.";
 }
 
@@ -307,7 +318,7 @@ function populateFilters() {
   const areas = [...new Set(state.features.map((site) => site.productionarea).filter(Boolean))].sort();
   const counties = [...new Set(state.features.map((site) => site.county).filter(Boolean))].sort();
 
-  areaFilter.innerHTML = ['<option value="all">All production areas</option>']
+  areaFilter.innerHTML = ['<option value="all">All areas</option>']
     .concat(areas.map((area) => `<option value="${escapeHtml(area)}">${escapeHtml(area)}</option>`))
     .join("");
   countyFilter.innerHTML = ['<option value="all">All counties</option>']
@@ -450,7 +461,7 @@ function renderSiteList() {
           <div class="site-card-bottom">
             <span class="status-pill ${risk}">${escapeHtml(formatStatusLabel(risk))}</span>
             <span class="site-meta">Current ratio ${formatNumber(site.femaleadult_to_limit_ratio)}x</span>
-            <span class="site-meta">Last treatment ${escapeHtml(formatDate(site.last_treatment_date))}</span>
+            <span class="site-meta">Last treatment week ${escapeHtml(formatWeekLabel(site.last_treatment_week_label))}</span>
           </div>
         </button>
       `;
@@ -559,7 +570,7 @@ function renderDetailPanel(site) {
         "Current status",
         `
           <div class="detail-grid">
-            ${detailKpi("Latest observation", formatDate(site.latest_observation_date))}
+            ${detailKpi("Latest reporting week", formatWeekLabel(site.latest_reporting_week_label))}
             ${detailKpi("Sea temperature", formatNumber(site.seatemperature))}
             ${detailKpi("Mobile lice", formatNumber(site.mobilelice))}
             ${detailKpi("Persistent lice", formatNumber(site.persistentlice))}
@@ -574,7 +585,7 @@ function renderDetailPanel(site) {
         "Treatment context",
         `
           <div class="detail-grid">
-            ${detailKpi("Last treatment date", formatDate(site.last_treatment_date))}
+            ${detailKpi("Last treatment week", formatWeekLabel(site.last_treatment_week_label))}
             ${detailKpi("Last treatment action", formatText(site.last_treatment_action))}
             ${detailKpi("Active ingredient", formatText(site.last_treatment_activeingredient))}
             ${detailKpi("Weeks since any treatment", formatNumber(site.weeks_since_any_treatment, 0))}
@@ -832,7 +843,7 @@ async function submitChat(message) {
   appendLoadingMessage();
 
   try {
-    const response = await fetch("/chat", {
+    const response = await fetch(buildApiUrl("/chat"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -852,7 +863,7 @@ async function submitChat(message) {
     syncChatStatus("Chat request failed.");
     appendChatMessage(
       "assistant",
-      `<div class="message-copy"><p>Chat request failed: ${escapeHtml(error.message)}</p></div>`,
+      `<div class="message-copy"><p>Chat request failed: ${escapeHtml(error.message)}</p><p>If the viewer is running from a static file server, start the FastAPI app with <code>python run_web.py</code> so the backend is available at <code>${escapeHtml(API_BASE || window.location.origin)}</code>.</p></div>`,
     );
   } finally {
     submitButton.disabled = false;
@@ -941,6 +952,16 @@ function wireControls() {
     }
     input.value = "";
     await submitChat(message);
+  });
+
+  document.getElementById("chat-input").addEventListener("keydown", (event) => {
+    if (event.isComposing) {
+      return;
+    }
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      document.getElementById("chat-form").requestSubmit();
+    }
   });
 
   document.addEventListener("keydown", (event) => {
@@ -1033,7 +1054,11 @@ map.on("load", async () => {
     wireControls();
     renderSuggestionChips();
     renderCaseDate();
-    syncChatStatus("Gemini on Vertex when available, with rule-based reasoning as a fallback.");
+    syncChatStatus(
+      API_BASE
+        ? `Gemini on Vertex when available. Backend: ${API_BASE}.`
+        : "Gemini on Vertex when available, with rule-based reasoning as a fallback.",
+    );
     setChatOpen(false);
     refreshView({ fitBounds: true });
     syncLayoutMetrics();
