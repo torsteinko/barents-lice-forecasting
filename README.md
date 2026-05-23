@@ -42,6 +42,19 @@ python run_web.py
 
 Then open `http://127.0.0.1:8000/` in a browser.
 
+If you instead serve the frontend statically, for example with `python -m http.server 8765`, the chat and `/api/sites` calls still need the FastAPI backend running separately. The viewer now defaults to `http://127.0.0.1:8000` as the backend when opened from a localhost static server.
+
+Static frontend plus FastAPI backend:
+
+```powershell
+python run_web.py
+python -m http.server 8765
+```
+
+Then open `http://127.0.0.1:8765/viewer/index.html`.
+
+If your backend is on a different origin, append `?api=http://host:port` to the viewer URL.
+
 The viewer is now a full-screen map application with:
 
 - floating filter and detail panels,
@@ -56,9 +69,17 @@ Primary endpoints:
 - `GET /api/sites`
 - `POST /chat`
 
-The chat endpoint uses deterministic ranking by default. If Vertex Gemini is configured, the backend will use it to turn the ranked site context into a more natural answer.
+The chat endpoint now uses a read-only LangChain SQL agent backed by DuckDB over `data/processed/master_table.parquet`.
 
-Optional Vertex Gemini environment variables are found in .env.example.
+- Each request builds two SQL views: `visible_master_table` for the current map scope and `master_table` for the full validated dataset.
+- The agent defaults to `visible_master_table` and only broadens to `master_table` when the user explicitly asks for all sites or broader history.
+- The backend enforces read-only SQL server-side and blocks non-`SELECT`/`WITH` statements and file-reading SQL functions before execution.
+
+Vertex Gemini configuration is required for `/chat`. Environment variables are shown in `.env.example`:
+
+- `GOOGLE_CLOUD_PROJECT`
+- `GOOGLE_CLOUD_LOCATION`
+- `VERTEX_GEMINI_MODEL` with default `gemini-3.1-flash-lite`
 
 Authentication should come from Application Default Credentials, for example through `gcloud auth application-default login` or a service-account-backed environment.
 

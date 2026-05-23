@@ -13,6 +13,8 @@ MAP_STATUS_COLUMNS = [
     "county",
     "productionareaid",
     "productionarea",
+    "year",
+    "week",
     "latitude",
     "longitude",
     "week_start_date",
@@ -70,8 +72,12 @@ def build_site_map_frame(
     case_cutoff_date = _derive_case_cutoff_date(predictions)
     if case_cutoff_date is not None:
         master = master[master["week_start_date"] <= case_cutoff_date].copy()
-        vtreatment = vtreatment[vtreatment["week_start_date"] <= case_cutoff_date].copy()
-        predictions = predictions[predictions["week_start_date"] <= case_cutoff_date].copy()
+        vtreatment = vtreatment[
+            vtreatment["week_start_date"] <= case_cutoff_date
+        ].copy()
+        predictions = predictions[
+            predictions["week_start_date"] <= case_cutoff_date
+        ].copy()
 
     latest_status = _build_latest_status(master)
     latest_treatment = _build_latest_treatment(vtreatment)
@@ -130,12 +136,21 @@ def build_site_map_frame(
         default="stable",
     )
     frame["latest_observation_date"] = frame["week_start_date"].dt.date.astype(str)
+    frame["latest_reporting_year"] = frame["year"]
+    frame["latest_reporting_week"] = frame["week"]
+    frame["latest_reporting_week_label"] = frame.apply(
+        lambda row: _format_reporting_week_label(row.get("year"), row.get("week")),
+        axis=1,
+    )
     frame = frame.sort_values(
         ["max_breach_risk", "femaleadult_to_limit_ratio", "femaleadult"],
         ascending=[False, False, False],
     ).reset_index(drop=True)
     if case_cutoff_date is not None:
         frame.attrs["case_cutoff_date"] = case_cutoff_date.date().isoformat()
+        frame.attrs["case_cutoff_week_label"] = _format_timestamp_week_label(
+            case_cutoff_date
+        )
     return frame
 
 
@@ -145,6 +160,7 @@ def build_site_map_geojson(site_map: pd.DataFrame) -> dict[str, object]:
         column for column in site_map.columns if column not in {"latitude", "longitude"}
     ]
     case_cutoff_date = site_map.attrs.get("case_cutoff_date")
+    case_cutoff_week_label = site_map.attrs.get("case_cutoff_week_label")
 
     for row in site_map.itertuples(index=False):
         latitude = getattr(row, "latitude", None)
@@ -172,6 +188,7 @@ def build_site_map_geojson(site_map: pd.DataFrame) -> dict[str, object]:
             "feature_count": len(features),
             "description": "Case snapshot capped at the prediction-supported cutoff date, with treatment context and holdout predictions aligned to the same case date.",
             "case_cutoff_date": case_cutoff_date,
+            "case_cutoff_week_label": case_cutoff_week_label,
         },
         "features": features,
     }
@@ -214,6 +231,8 @@ def _build_latest_status(master: pd.DataFrame) -> pd.DataFrame:
 def _build_latest_treatment(vtreatment: pd.DataFrame) -> pd.DataFrame:
     treatment_columns = [
         "sitenumber",
+        "year",
+        "week",
         "week_start_date",
         "action",
         "typeoftreatment",
@@ -230,6 +249,8 @@ def _build_latest_treatment(vtreatment: pd.DataFrame) -> pd.DataFrame:
     )
     return latest_treatment.rename(
         columns={
+            "year": "last_treatment_year",
+            "week": "last_treatment_week",
             "week_start_date": "last_treatment_date",
             "action": "last_treatment_action",
             "typeoftreatment": "last_treatment_type",
@@ -237,6 +258,13 @@ def _build_latest_treatment(vtreatment: pd.DataFrame) -> pd.DataFrame:
             "scope": "last_treatment_scope",
             "cleanerfish": "last_treatment_cleanerfish",
         }
+    ).assign(
+        last_treatment_week_label=lambda frame: frame.apply(
+            lambda row: _format_reporting_week_label(
+                row.get("last_treatment_year"), row.get("last_treatment_week")
+            ),
+            axis=1,
+        )
     )
 
 
@@ -323,3 +351,20 @@ def _jsonify(value):
     if isinstance(value, str) and not value.strip():
         return None
     return value
+
+
+def _format_reporting_week_label(year: object, week: object) -> str | None:
+    if pd.isna(year) or pd.isna(week):
+        return None
+    try:
+        return f"{int(year)}-W{int(week):02d}"
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_timestamp_week_label(value: pd.Timestamp | object) -> str | None:
+    timestamp = pd.to_datetime(value, errors="coerce")
+    if pd.isna(timestamp):
+        return None
+    iso = timestamp.isocalendar()
+    return f"{int(iso.year)}-W{int(iso.week):02d}"
