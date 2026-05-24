@@ -118,14 +118,28 @@ def build_site_map_frame(
         frame["max_breach_risk"] = np.nan
         frame["priority_horizon"] = None
 
-    frame["current_limit_excess"] = (
-        frame["femaleadult"].fillna(0.0) - frame["licelimitweek"].fillna(np.inf)
-    ).clip(lower=0.0)
-    frame["currently_over_limit"] = np.where(
-        frame["overthelicelimitweek"].notna(),
-        frame["overthelicelimitweek"],
-        frame["femaleadult"].fillna(-np.inf) > frame["licelimitweek"].fillna(np.inf),
+    has_current_count = (
+        frame["havecountedlice"].fillna(False)
+        & frame["femaleadult"].notna()
+        & frame["licelimitweek"].notna()
     )
+    frame["current_limit_excess"] = (
+        frame["femaleadult"] - frame["licelimitweek"]
+    ).clip(lower=0.0)
+    frame["current_limit_excess"] = frame["current_limit_excess"].where(
+        has_current_count
+    )
+
+    frame["currently_over_limit"] = pd.Series(pd.NA, index=frame.index, dtype="boolean")
+    reported_over_limit = frame["overthelicelimitweek"].notna() & has_current_count
+    derived_over_limit = ~reported_over_limit & has_current_count
+    frame.loc[reported_over_limit, "currently_over_limit"] = frame.loc[
+        reported_over_limit, "overthelicelimitweek"
+    ].astype("boolean")
+    frame.loc[derived_over_limit, "currently_over_limit"] = (
+        frame.loc[derived_over_limit, "femaleadult"]
+        > frame.loc[derived_over_limit, "licelimitweek"]
+    ).astype("boolean")
     frame["risk_band"] = np.select(
         [
             frame["max_breach_risk"].fillna(0.0) >= 0.8,
@@ -186,7 +200,7 @@ def build_site_map_geojson(site_map: pd.DataFrame) -> dict[str, object]:
         "type": "FeatureCollection",
         "metadata": {
             "feature_count": len(features),
-            "description": "Case snapshot capped at the prediction-supported cutoff date, with treatment context and holdout predictions aligned to the same case date.",
+            "description": "Site snapshot aligned to the model-backed snapshot date, with treatment context and prediction outputs written against the same reporting window.",
             "case_cutoff_date": case_cutoff_date,
             "case_cutoff_week_label": case_cutoff_week_label,
         },

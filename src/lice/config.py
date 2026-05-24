@@ -7,6 +7,13 @@ RAW_VTREATMENT_PATH = DATA_DIR / "vtreatment.csv"
 PROCESSED_DIR = DATA_DIR / "processed"
 RESULTS_DIR = ROOT_DIR / "results"
 MODELS_DIR = RESULTS_DIR / "models"
+MASTER_TABLE_PATH = PROCESSED_DIR / "master_table.parquet"
+LATEST_MASTER_TABLE_PATH = PROCESSED_DIR / "master_table_latest.parquet"
+SITE_MAP_PATH = RESULTS_DIR / "site_map.geojson"
+LATEST_SITE_MAP_PATH = RESULTS_DIR / "site_map_latest.geojson"
+MODEL_METRICS_PATH = RESULTS_DIR / "model_metrics.json"
+LATEST_PREDICTIONS_PATH = RESULTS_DIR / "latest_predictions.csv"
+LATEST_SITE_SNAPSHOT_PATH = RESULTS_DIR / "latest_site_snapshot.csv"
 
 RANDOM_SEED = 42
 HORIZONS = (1, 2, 12)

@@ -13,7 +13,12 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import create_engine
 from sqlalchemy.pool import StaticPool
 
-from .config import PROCESSED_DIR, RESULTS_DIR
+from .config import (
+    LATEST_MASTER_TABLE_PATH,
+    LATEST_SITE_MAP_PATH,
+    MASTER_TABLE_PATH,
+    SITE_MAP_PATH,
+)
 
 try:
     import google.auth
@@ -114,7 +119,6 @@ if BaseQuerySQLDatabaseTool is not None and BaseSQLDatabaseToolkit is not None:
                 return f"Error: {violation}"
             return self.db.run_no_throw(query, include_columns=True)
 
-
     class ReadOnlySQLDatabaseToolkit(BaseSQLDatabaseToolkit):
         def get_tools(self) -> list[Any]:
             list_tool = ListSQLDatabaseTool(db=self.db)
@@ -147,10 +151,12 @@ class SiteChatService:
         geojson_path: Path | None = None,
         master_table_path: Path | None = None,
     ) -> None:
-        self.geojson_path = geojson_path or RESULTS_DIR / "site_map.geojson"
-        self.master_table_path = (
-            master_table_path or PROCESSED_DIR / "master_table.parquet"
-        )
+        self._requested_geojson_path = geojson_path
+        self._requested_master_table_path = master_table_path
+        self.default_geojson_path = SITE_MAP_PATH
+        self.latest_geojson_path = LATEST_SITE_MAP_PATH
+        self.default_master_table_path = MASTER_TABLE_PATH
+        self.latest_master_table_path = LATEST_MASTER_TABLE_PATH
         self._cached_geojson: dict[str, object] | None = None
         self._cached_frame: pd.DataFrame | None = None
         self._cached_site_index: pd.DataFrame | None = None
@@ -163,6 +169,8 @@ class SiteChatService:
         self._cached_extractor: Any | None = None
         self._last_llm_error: str | None = None
         self._case_cutoff_date: pd.Timestamp | None = None
+        self._active_geojson_path: Path | None = None
+        self._active_master_table_path: Path | None = None
 
     def get_geojson(self) -> dict[str, object]:
         self._ensure_loaded()
@@ -175,6 +183,7 @@ class SiteChatService:
         return int(len(self._cached_frame))
 
     def get_llm_status(self) -> dict[str, object]:
+        geojson_path, master_table_path = self._resolve_data_paths()
         project = os.getenv("GOOGLE_CLOUD_PROJECT")
         location = os.getenv("GOOGLE_CLOUD_LOCATION")
         model_name = os.getenv("VERTEX_GEMINI_MODEL", DEFAULT_CHAT_MODEL)
@@ -198,7 +207,9 @@ class SiteChatService:
             and ReadOnlySQLDatabaseToolkit is not None
         )
         return {
-            "provider": "vertex-gemini" if ChatVertexAI is not None else "fallback-only",
+            "provider": (
+                "vertex-gemini" if ChatVertexAI is not None else "fallback-only"
+            ),
             "configured": configured,
             "project": project,
             "location": location,
@@ -207,6 +218,8 @@ class SiteChatService:
             "adc_available": adc_error is None,
             "adc_error": adc_error,
             "last_error": self._last_llm_error,
+            "site_snapshot_path": str(geojson_path),
+            "chat_dataset_path": str(master_table_path),
         }
 
     def answer_question(
@@ -232,8 +245,9 @@ class SiteChatService:
                 visible_site_ids=visible_site_ids,
             )
 
-        if not self.master_table_path.exists():
-            self._last_llm_error = f"Missing chat dataset at {self.master_table_path}"
+        master_table_path = self._active_master_table_path or self._resolve_data_paths()[1]
+        if not master_table_path.exists():
+            self._last_llm_error = f"Missing chat dataset at {master_table_path}"
             return self._build_failure_response(
                 "The chat dataset is not available right now.",
                 selected_site_id=selected_site_id,
@@ -284,14 +298,29 @@ class SiteChatService:
             "llm": self.get_llm_status(),
         }
 
-    def _ensure_loaded(self) -> None:
-        if not self.geojson_path.exists():
-            raise FileNotFoundError(f"Missing map dataset at {self.geojson_path}")
+    def _resolve_data_paths(self) -> tuple[Path, Path]:
+        if self._requested_geojson_path is not None or self._requested_master_table_path is not None:
+            geojson_path = self._requested_geojson_path or self.default_geojson_path
+            master_table_path = (
+                self._requested_master_table_path or self.default_master_table_path
+            )
+            return geojson_path, master_table_path
 
-        current_mtime = self.geojson_path.stat().st_mtime
+        if self.latest_geojson_path.exists() and self.latest_master_table_path.exists():
+            return self.latest_geojson_path, self.latest_master_table_path
+
+        return self.default_geojson_path, self.default_master_table_path
+
+    def _ensure_loaded(self) -> None:
+        geojson_path, master_table_path = self._resolve_data_paths()
+
+        if not geojson_path.exists():
+            raise FileNotFoundError(f"Missing map dataset at {geojson_path}")
+
+        current_mtime = geojson_path.stat().st_mtime
         parquet_mtime = (
-            self.master_table_path.stat().st_mtime
-            if self.master_table_path.exists()
+            master_table_path.stat().st_mtime
+            if master_table_path.exists()
             else None
         )
         if (
@@ -299,10 +328,12 @@ class SiteChatService:
             and self._cached_frame is not None
             and self._cached_mtime == current_mtime
             and self._cached_parquet_mtime == parquet_mtime
+            and self._active_geojson_path == geojson_path
+            and self._active_master_table_path == master_table_path
         ):
             return
 
-        geojson = json.loads(self.geojson_path.read_text(encoding="utf-8"))
+        geojson = json.loads(geojson_path.read_text(encoding="utf-8"))
         case_cutoff_date = _parse_case_cutoff_date(geojson)
         records: list[dict[str, object]] = []
         for feature in geojson.get("features", []):
@@ -384,11 +415,9 @@ class SiteChatService:
 
         parquet_columns: set[str] = set()
         parquet_schema_error = None
-        if self.master_table_path.exists():
+        if master_table_path.exists():
             try:
-                parquet_columns = set(
-                    pq.ParquetFile(self.master_table_path).schema.names
-                )
+                parquet_columns = set(pq.ParquetFile(master_table_path).schema.names)
             except Exception as exc:
                 parquet_schema_error = _truncate_error(exc)
 
@@ -406,6 +435,8 @@ class SiteChatService:
         self._cached_parquet_columns = parquet_columns
         self._parquet_schema_error = parquet_schema_error
         self._case_cutoff_date = case_cutoff_date
+        self._active_geojson_path = geojson_path
+        self._active_master_table_path = master_table_path
 
     def _create_duckdb_engine(self) -> Any:
         return create_engine(
@@ -419,7 +450,8 @@ class SiteChatService:
         engine: Any,
         visible_site_ids: Sequence[str] | None,
     ) -> Any:
-        parquet_path = self.master_table_path.resolve().as_posix()
+        master_table_path = self._active_master_table_path or self._resolve_data_paths()[1]
+        parquet_path = master_table_path.resolve().as_posix()
         with engine.begin() as connection:
             connection.exec_driver_sql(self._build_master_view_sql(parquet_path))
             connection.exec_driver_sql(self._build_visible_view_sql(visible_site_ids))
@@ -464,7 +496,9 @@ class SiteChatService:
                 "SELECT * FROM master_table WHERE 1 = 0"
             )
 
-        quoted_ids = ", ".join(_quote_sql_literal(site_id) for site_id in normalized_ids)
+        quoted_ids = ", ".join(
+            _quote_sql_literal(site_id) for site_id in normalized_ids
+        )
         return (
             "CREATE OR REPLACE VIEW visible_master_table AS "
             "SELECT * FROM master_table "
@@ -493,7 +527,11 @@ class SiteChatService:
             agent_executor_kwargs={"handle_parsing_errors": True},
         )
         result = agent_executor.invoke(
-            {"input": self._build_agent_input(message, selected_site_id, visible_site_ids)}
+            {
+                "input": self._build_agent_input(
+                    message, selected_site_id, visible_site_ids
+                )
+            }
         )
         output = result.get("output") if isinstance(result, dict) else None
         if not isinstance(output, str) or not output.strip():
@@ -533,7 +571,7 @@ class SiteChatService:
             "- The answer field must contain the user-facing answer text.\n"
             "- The sitenumbers field must contain only relevant sitenumber values from the database, converted to strings. Use an empty list when no sites are relevant.\n"
             "- Do not wrap the final JSON in code fences.\n"
-            "- If the question is unrelated to the database, return JSON with answer set to \"I don't know\" and an empty sitenumbers list."
+            '- If the question is unrelated to the database, return JSON with answer set to "I don\'t know" and an empty sitenumbers list.'
         )
 
     def _build_agent_suffix(self) -> str:
@@ -555,7 +593,9 @@ class SiteChatService:
             parts.append(
                 f"Visible map site count: {len(_normalize_site_ids(visible_site_ids))}"
             )
-        parts.append("Return only the final JSON object when you have enough information.")
+        parts.append(
+            "Return only the final JSON object when you have enough information."
+        )
         return "\n".join(parts)
 
     def _get_llm(self) -> Any:
@@ -657,15 +697,11 @@ class SiteChatService:
                 "SQL chat defaults to visible_master_table for the current map scope. "
                 "Ask explicitly for all sites to broaden the query."
             )
-        return (
-            "The current map scope has no visible sites, so visible_master_table is empty unless the question explicitly asks for all sites."
-        )
+        return "The current map scope has no visible sites, so visible_master_table is empty unless the question explicitly asks for all sites."
 
     def _describe_visible_scope(self, visible_site_ids: Sequence[str] | None) -> str:
         if visible_site_ids is None:
-            return (
-                "no explicit visible-site subset was provided, so visible_master_table mirrors master_table"
-            )
+            return "no explicit visible-site subset was provided, so visible_master_table mirrors master_table"
         visible_count = len(_normalize_site_ids(visible_site_ids))
         if visible_count:
             return f"visible_master_table contains {visible_count} visible site(s) from the current map state"
@@ -724,9 +760,7 @@ class SiteChatService:
             "latest_reporting_week_label": _jsonify(
                 row.get("latest_reporting_week_label")
             ),
-            "last_treatment_week_label": _jsonify(
-                row.get("last_treatment_week_label")
-            ),
+            "last_treatment_week_label": _jsonify(row.get("last_treatment_week_label")),
             "last_treatment_action": _jsonify(row.get("last_treatment_action")),
             "last_treatment_activeingredient": _jsonify(
                 row.get("last_treatment_activeingredient")
@@ -752,12 +786,16 @@ def _validate_read_only_query(query: str) -> str | None:
     if leading_keyword not in READ_ONLY_ALLOWED_LEADING_KEYWORDS:
         return "Only a read-only SELECT or WITH query is allowed."
 
-    blocked_keyword_pattern = r"\b(" + "|".join(sorted(READ_ONLY_BLOCKED_KEYWORDS)) + r")\b"
+    blocked_keyword_pattern = (
+        r"\b(" + "|".join(sorted(READ_ONLY_BLOCKED_KEYWORDS)) + r")\b"
+    )
     blocked_keyword = re.search(blocked_keyword_pattern, normalized)
     if blocked_keyword is not None:
         return f"The query contains a blocked keyword: {blocked_keyword.group(1)}."
 
-    blocked_function_pattern = r"\b(" + "|".join(sorted(READ_ONLY_BLOCKED_FUNCTIONS)) + r")\s*\("
+    blocked_function_pattern = (
+        r"\b(" + "|".join(sorted(READ_ONLY_BLOCKED_FUNCTIONS)) + r")\s*\("
+    )
     blocked_function = re.search(blocked_function_pattern, normalized)
     if blocked_function is not None:
         return f"The query contains a blocked function: {blocked_function.group(1)}."
@@ -778,9 +816,7 @@ def _validate_read_only_query(query: str) -> str | None:
             continue
         relation_name = candidate.split(".")[-1].strip('"')
         if relation_name not in allowed_relations:
-            return (
-                "Queries may only read from the master_table or visible_master_table views."
-            )
+            return "Queries may only read from the master_table or visible_master_table views."
 
     return None
 
@@ -842,9 +878,7 @@ def _coerce_agent_payload(payload: Any, raw_output: str) -> AgentResultPayload:
         for value in sitenumber_values:
             if isinstance(value, dict):
                 site_value = (
-                    value.get("sitenumber")
-                    or value.get("site_id")
-                    or value.get("site")
+                    value.get("sitenumber") or value.get("site_id") or value.get("site")
                 )
                 if site_value is not None:
                     coerced_sitenumbers.append(str(site_value))

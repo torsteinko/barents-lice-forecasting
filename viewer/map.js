@@ -38,6 +38,57 @@ const CHAT_SUGGESTIONS = [
   "Show me the highest 12-week risk sites that were treated recently.",
 ];
 
+const KPI_HELP = {
+  current_female_adult:
+    "Reported female-adult lice for this site in the latest reporting week. A dash means the site did not report a count that week.",
+  limit_ratio:
+    "Reported female-adult lice divided by the weekly lice limit for this site. Values above 1.00x are above the limit.",
+  currently_over_limit:
+    "Whether the reported female-adult lice count is above the weekly lice limit in the latest reporting week. A dash means the week was not reported.",
+  forecast_1w:
+    "Probability of at least one lice-limit breach in the next reported week. The count line is the model's expected number of breaches in that same horizon.",
+  forecast_2w:
+    "Probability of at least one lice-limit breach within the next 2 reported weeks. The count line is the expected total number of breaches in that 2-week window.",
+  forecast_12w:
+    "Probability of at least one lice-limit breach within the next 12 reported weeks. The count line is the expected total number of breaches in that 12-week window.",
+  latest_reporting_week:
+    "The reporting week used for this site's current-status snapshot.",
+  sea_temperature:
+    "Reported sea temperature for the latest reporting week. A dash means it was not reported that week.",
+  mobile_lice:
+    "Reported mobile-stage lice level for the latest reporting week. A dash means it was not reported that week.",
+  persistent_lice:
+    "Reported persistent lice level for the latest reporting week. A dash means it was not reported that week.",
+  counted_lice_this_week:
+    "Whether the site submitted a lice count in the latest reporting week.",
+  likely_no_fish:
+    "BarentsWatch flag indicating the site likely had no fish present in the latest reporting week.",
+  last_treatment_week:
+    "Most recent treatment week recorded for this site.",
+  last_treatment_action:
+    "Most recent treatment action category recorded for this site.",
+  active_ingredient:
+    "Active ingredient from the most recent recorded treatment, when applicable.",
+  weeks_since_any_treatment:
+    "Number of weeks since any treatment was last recorded for this site.",
+  this_week_treatment_count:
+    "Number of treatment records attached to this site in the current reporting week.",
+  cleaner_fish_treatments:
+    "Number of cleaner-fish treatment records attached to this site in the current reporting week.",
+  area_breach_rate_previous_week:
+    "Share of sites in the same production area that were over the lice limit in the previous reporting week.",
+  area_treatment_rate_previous_week:
+    "Share of sites in the same production area that had any treatment in the previous reporting week.",
+  neighbor_breach_rate_previous_week:
+    "Share of nearby sites that were over the lice limit in the previous reporting week.",
+  neighbor_limit_ratio_previous_week:
+    "Average female-adult-lice-to-limit ratio among nearby sites in the previous reporting week.",
+  neighbor_sites_within_50_km:
+    "How many nearby sites were available within the 50 km neighborhood used for neighbor-pressure features.",
+  priority_horizon:
+    "The forecast horizon with the highest breach probability for this site after enforcing nested horizon ordering.",
+};
+
 const DEFAULT_LOCAL_API_ORIGIN = "http://127.0.0.1:8000";
 
 function resolveApiBase() {
@@ -77,6 +128,7 @@ const state = {
   recentTreatmentOnly: false,
   countedOnly: false,
   chatOpen: false,
+  duplicateSiteNameKeys: new Set(),
 };
 
 const map = new maplibregl.Map({
@@ -105,6 +157,9 @@ function formatStatusLabel(value) {
 }
 
 function toNumber(value) {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
   const numeric = Number(value);
   return Number.isFinite(numeric) ? numeric : null;
 }
@@ -133,6 +188,14 @@ function formatPercent(value) {
   return `${Math.round(numeric * 100)}%`;
 }
 
+function formatRatio(value, digits = 2) {
+  const numeric = toNumber(value);
+  if (numeric === null) {
+    return "--";
+  }
+  return `${numeric.toFixed(digits)}x`;
+}
+
 function formatWeekLabel(value) {
   return formatText(value);
 }
@@ -149,6 +212,71 @@ function formatBoolean(value) {
     return "--";
   }
   return value ? "Yes" : "No";
+}
+
+function renderKpiHelp(helpText) {
+  if (!helpText) {
+    return "";
+  }
+  const safeHelpText = escapeHtml(helpText);
+  return `<span class="detail-kpi-help" tabindex="0" aria-label="${safeHelpText}" data-tooltip="${safeHelpText}">?</span>`;
+}
+
+function normalizeNameKey(value) {
+  if (value === null || value === undefined) {
+    return "";
+  }
+  return String(value).trim().toLowerCase();
+}
+
+function buildSiteDisplayName(site) {
+  if (site?.display_name) {
+    return formatText(site.display_name);
+  }
+
+  const baseName = formatText(site?.sitename);
+  const isDuplicate = state.duplicateSiteNameKeys.has(normalizeNameKey(site?.sitename));
+  if (!isDuplicate) {
+    return baseName;
+  }
+
+  const parts = [];
+  const municipality = formatText(site?.municipality);
+  const county = formatText(site?.county);
+  const siteId = formatText(site?.site_id ?? site?.sitenumber);
+  if (municipality !== "--") {
+    parts.push(municipality);
+  }
+  if (county !== "--") {
+    parts.push(county);
+  }
+  if (siteId !== "--") {
+    parts.push(`Site ${siteId}`);
+  }
+  if (!parts.length) {
+    return baseName;
+  }
+  return `${baseName} (${parts.join(", ")})`;
+}
+
+function annotateDuplicateSiteNames(features) {
+  const counts = new Map();
+  features.forEach((site) => {
+    const key = normalizeNameKey(site.sitename);
+    if (!key) {
+      return;
+    }
+    counts.set(key, (counts.get(key) || 0) + 1);
+  });
+
+  state.duplicateSiteNameKeys = new Set(
+    [...counts.entries()].filter(([, count]) => count > 1).map(([key]) => key),
+  );
+
+  return features.map((site) => ({
+    ...site,
+    display_name: buildSiteDisplayName(site),
+  }));
 }
 
 function escapeHtml(value) {
@@ -182,7 +310,7 @@ function formatMetric(site, metricKey = state.currentMetric) {
   if (value === null) {
     return "--";
   }
-  return metric.kind === "probability" ? formatPercent(value) : `${formatNumber(value)}x`;
+  return metric.kind === "probability" ? formatPercent(value) : formatRatio(value);
 }
 
 function riskBucket(value, metricKey = state.currentMetric) {
@@ -249,7 +377,11 @@ function normalizeFeature(feature) {
 }
 
 async function fetchSiteDataset() {
-  const endpoints = [buildApiUrl("/api/sites"), "../results/site_map.geojson"];
+  const endpoints = [
+    buildApiUrl("/api/sites"),
+    "../results/site_map_latest.geojson",
+    "../results/site_map.geojson",
+  ];
   for (const endpoint of endpoints) {
     try {
       const response = await fetch(endpoint);
@@ -268,8 +400,8 @@ function renderCaseDate() {
   const caseWeek = state.datasetMeta?.case_cutoff_week_label || null;
   document.getElementById("case-date-value").textContent = formatWeekLabel(caseWeek);
   document.getElementById("case-date-note").textContent = caseWeek
-    ? `Everything shown here is capped at reporting week ${formatWeekLabel(caseWeek)}, not the real present day.`
-    : "All site status, treatment context, and answers are capped at the case cutoff.";
+    ? `Everything shown here is aligned to the latest scored reporting week ${formatWeekLabel(caseWeek)}.`
+    : "All site status, treatment context, and answers are aligned to the latest scored snapshot.";
 }
 
 function renderMetricSwitcher() {
@@ -354,7 +486,7 @@ function buildLegend() {
 }
 
 function formatLegendValue(value, kind) {
-  return kind === "probability" ? formatPercent(value) : `${formatNumber(value)}x`;
+  return kind === "probability" ? formatPercent(value) : formatRatio(value);
 }
 
 function filterSites() {
@@ -366,6 +498,7 @@ function filterSites() {
     const matchesCounty = state.county === "all" || site.county === state.county;
     const matchesSearch =
       query === "" ||
+      buildSiteDisplayName(site).toLowerCase().includes(query) ||
       formatText(site.sitename).toLowerCase().includes(query) ||
       formatText(site.municipality).toLowerCase().includes(query) ||
       formatText(site.sitenumber).toLowerCase().includes(query);
@@ -397,7 +530,7 @@ function sortSites(sites) {
     if (ratioGap !== 0) {
       return ratioGap;
     }
-    return formatText(left.sitename).localeCompare(formatText(right.sitename));
+    return buildSiteDisplayName(left).localeCompare(buildSiteDisplayName(right));
   });
 }
 
@@ -406,7 +539,7 @@ function renderStats() {
   const critical = visible.filter((site) => riskBucket(metricValue(site)) === "critical").length;
   const overLimit = visible.filter((site) => Boolean(site.currently_over_limit)).length;
   const treated = visible.filter((site) => (toNumber(site.weeks_since_any_treatment) ?? Number.POSITIVE_INFINITY) <= 4).length;
-  const topSite = visible[0] ? formatText(visible[0].sitename) : "--";
+  const topSite = visible[0] ? buildSiteDisplayName(visible[0]) : "--";
 
   document.getElementById("stats-grid").innerHTML = `
     <article class="metric-card">
@@ -453,14 +586,14 @@ function renderSiteList() {
         <button type="button" class="site-card ${selectedClass}" data-site-id="${escapeHtml(site.id)}">
           <div class="site-card-top">
             <div>
-              <strong>${escapeHtml(formatText(site.sitename))}</strong>
-              <div class="site-meta">${escapeHtml(formatText(site.productionarea))} | ${escapeHtml(formatText(site.county))}</div>
+              <strong>${escapeHtml(buildSiteDisplayName(site))}</strong>
+              <div class="site-meta">${escapeHtml(formatText(site.municipality))} | ${escapeHtml(formatText(site.county))} | Site ${escapeHtml(formatText(site.sitenumber))}</div>
             </div>
             <strong class="metric-number">${escapeHtml(formatMetric(site))}</strong>
           </div>
           <div class="site-card-bottom">
             <span class="status-pill ${risk}">${escapeHtml(formatStatusLabel(risk))}</span>
-            <span class="site-meta">Current ratio ${formatNumber(site.femaleadult_to_limit_ratio)}x</span>
+            <span class="site-meta">Current ratio ${formatRatio(site.femaleadult_to_limit_ratio)}</span>
             <span class="site-meta">Last treatment week ${escapeHtml(formatWeekLabel(site.last_treatment_week_label))}</span>
           </div>
         </button>
@@ -484,10 +617,13 @@ function detailSection(title, content, open = false) {
   `;
 }
 
-function detailKpi(label, value) {
+function detailKpi(label, value, helpText = "") {
   return `
     <div class="detail-kpi">
-      <span>${escapeHtml(label)}</span>
+      <div class="detail-kpi-head">
+        <span>${escapeHtml(label)}</span>
+        ${renderKpiHelp(helpText)}
+      </div>
       <strong>${escapeHtml(value)}</strong>
     </div>
   `;
@@ -497,9 +633,13 @@ function forecastCard(site, horizon) {
   const score = site[`classifier_${horizon}w_score`];
   const count = site[`count_${horizon}w_prediction`];
   const risk = riskBucket(score, `classifier_${horizon}w_score`);
+  const helpText = horizon === 1 ? KPI_HELP.forecast_1w : horizon === 2 ? KPI_HELP.forecast_2w : KPI_HELP.forecast_12w;
   return `
     <div class="detail-kpi">
-      <span>${horizon}w breach risk</span>
+      <div class="detail-kpi-head">
+        <span>${horizon}w breach risk</span>
+        ${renderKpiHelp(helpText)}
+      </div>
       <strong>${escapeHtml(formatPercent(score))}</strong>
       <span class="mini-pill ${risk}">${escapeHtml(formatStatusLabel(risk))}</span>
       <span>Predicted count ${escapeHtml(formatNumber(count))}</span>
@@ -529,8 +669,8 @@ function renderDetailPanel(site) {
         <div class="detail-topline">
           <div>
             <p class="eyebrow">Selected site</p>
-            <h2>${escapeHtml(formatText(site.sitename))}</h2>
-            <p class="detail-copy">${escapeHtml(formatText(site.productionarea))} | ${escapeHtml(formatText(site.county))} | Site ${escapeHtml(formatText(site.sitenumber))}</p>
+            <h2>${escapeHtml(buildSiteDisplayName(site))}</h2>
+            <p class="detail-copy">${escapeHtml(formatText(site.productionarea))} | ${escapeHtml(formatText(site.municipality))} | ${escapeHtml(formatText(site.county))} | Site ${escapeHtml(formatText(site.sitenumber))}</p>
           </div>
           <span class="status-pill ${risk}">${escapeHtml(formatStatusLabel(risk))}</span>
         </div>
@@ -539,18 +679,9 @@ function renderDetailPanel(site) {
           <span class="badge">Coords ${escapeHtml(formatNumber(site.latitude, 4))}, ${escapeHtml(formatNumber(site.longitude, 4))}</span>
         </div>
         <div class="detail-kpis">
-          <div class="detail-kpi">
-            <span>Current female adult</span>
-            <strong>${escapeHtml(formatNumber(site.femaleadult))}</strong>
-          </div>
-          <div class="detail-kpi">
-            <span>Limit ratio</span>
-            <strong>${escapeHtml(formatNumber(site.femaleadult_to_limit_ratio))}x</strong>
-          </div>
-          <div class="detail-kpi">
-            <span>Currently over limit</span>
-            <strong>${escapeHtml(formatBoolean(site.currently_over_limit))}</strong>
-          </div>
+          ${detailKpi("Current female adult", formatNumber(site.femaleadult), KPI_HELP.current_female_adult)}
+          ${detailKpi("Limit ratio", formatRatio(site.femaleadult_to_limit_ratio), KPI_HELP.limit_ratio)}
+          ${detailKpi("Currently over limit", formatBoolean(site.currently_over_limit), KPI_HELP.currently_over_limit)}
         </div>
       </section>
 
@@ -570,12 +701,12 @@ function renderDetailPanel(site) {
         "Current status",
         `
           <div class="detail-grid">
-            ${detailKpi("Latest reporting week", formatWeekLabel(site.latest_reporting_week_label))}
-            ${detailKpi("Sea temperature", formatNumber(site.seatemperature))}
-            ${detailKpi("Mobile lice", formatNumber(site.mobilelice))}
-            ${detailKpi("Persistent lice", formatNumber(site.persistentlice))}
-            ${detailKpi("Counted lice this week", formatBoolean(site.havecountedlice))}
-            ${detailKpi("Likely no fish", formatBoolean(site.likelynofish))}
+            ${detailKpi("Latest reporting week", formatWeekLabel(site.latest_reporting_week_label), KPI_HELP.latest_reporting_week)}
+            ${detailKpi("Sea temperature", formatNumber(site.seatemperature), KPI_HELP.sea_temperature)}
+            ${detailKpi("Mobile lice", formatNumber(site.mobilelice), KPI_HELP.mobile_lice)}
+            ${detailKpi("Persistent lice", formatNumber(site.persistentlice), KPI_HELP.persistent_lice)}
+            ${detailKpi("Counted lice this week", formatBoolean(site.havecountedlice), KPI_HELP.counted_lice_this_week)}
+            ${detailKpi("Likely no fish", formatBoolean(site.likelynofish), KPI_HELP.likely_no_fish)}
           </div>
         `,
         true,
@@ -585,12 +716,12 @@ function renderDetailPanel(site) {
         "Treatment context",
         `
           <div class="detail-grid">
-            ${detailKpi("Last treatment week", formatWeekLabel(site.last_treatment_week_label))}
-            ${detailKpi("Last treatment action", formatText(site.last_treatment_action))}
-            ${detailKpi("Active ingredient", formatText(site.last_treatment_activeingredient))}
-            ${detailKpi("Weeks since any treatment", formatNumber(site.weeks_since_any_treatment, 0))}
-            ${detailKpi("This-week treatment count", formatNumber(site.treatment_count, 0))}
-            ${detailKpi("Cleaner fish treatments", formatNumber(site.cleanerfish_treatment_count, 0))}
+            ${detailKpi("Last treatment week", formatWeekLabel(site.last_treatment_week_label), KPI_HELP.last_treatment_week)}
+            ${detailKpi("Last treatment action", formatText(site.last_treatment_action), KPI_HELP.last_treatment_action)}
+            ${detailKpi("Active ingredient", formatText(site.last_treatment_activeingredient), KPI_HELP.active_ingredient)}
+            ${detailKpi("Weeks since any treatment", formatNumber(site.weeks_since_any_treatment, 0), KPI_HELP.weeks_since_any_treatment)}
+            ${detailKpi("This-week treatment count", formatNumber(site.treatment_count, 0), KPI_HELP.this_week_treatment_count)}
+            ${detailKpi("Cleaner fish treatments", formatNumber(site.cleanerfish_treatment_count, 0), KPI_HELP.cleaner_fish_treatments)}
           </div>
         `,
         true,
@@ -600,12 +731,12 @@ function renderDetailPanel(site) {
         "Pressure context",
         `
           <div class="detail-grid">
-            ${detailKpi("Area breach rate lag1", formatPercent(site.pa_breach_rate_lag1))}
-            ${detailKpi("Area treatment rate lag1", formatPercent(site.pa_treatment_rate_lag1))}
-            ${detailKpi("Neighbor breach rate lag1", formatPercent(site.neighbor_breach_this_week_lag1))}
-            ${detailKpi("Neighbor limit ratio lag1", `${formatNumber(site.neighbor_femaleadult_to_limit_ratio_lag1)}x`)}
-            ${detailKpi("Neighbor sites in radius", formatNumber(site.neighbor_site_count, 0))}
-            ${detailKpi("Priority horizon", formatText(site.priority_horizon))}
+            ${detailKpi("Area breach rate, previous week", formatPercent(site.pa_breach_rate_lag1), KPI_HELP.area_breach_rate_previous_week)}
+            ${detailKpi("Area treatment rate, previous week", formatPercent(site.pa_treatment_rate_lag1), KPI_HELP.area_treatment_rate_previous_week)}
+            ${detailKpi("Neighbor breach rate, previous week", formatPercent(site.neighbor_breach_this_week_lag1), KPI_HELP.neighbor_breach_rate_previous_week)}
+            ${detailKpi("Neighbor limit ratio, previous week", formatRatio(site.neighbor_femaleadult_to_limit_ratio_lag1), KPI_HELP.neighbor_limit_ratio_previous_week)}
+            ${detailKpi("Neighbor sites within 50 km", formatNumber(site.neighbor_site_count, 0), KPI_HELP.neighbor_sites_within_50_km)}
+            ${detailKpi("Priority horizon", formatText(site.priority_horizon), KPI_HELP.priority_horizon)}
           </div>
         `,
         true,
@@ -636,6 +767,7 @@ function buildGeojson() {
         properties: {
           id: site.id,
           sitename: formatText(site.sitename),
+          displayName: buildSiteDisplayName(site),
           productionarea: formatText(site.productionarea),
           metricDisplay: formatMetric(site),
           metricLabel: METRICS[state.currentMetric].label,
@@ -765,14 +897,14 @@ function renderChatResult(payload) {
         <article class="result-card">
           <div class="result-card-top">
             <div>
-              <strong>${escapeHtml(formatText(site.sitename))}</strong>
-              <div class="site-meta">${escapeHtml(formatText(site.productionarea))} | ${escapeHtml(formatText(site.county))}</div>
+              <strong>${escapeHtml(buildSiteDisplayName(site))}</strong>
+              <div class="site-meta">${escapeHtml(formatText(site.municipality))} | ${escapeHtml(formatText(site.county))} | Site ${escapeHtml(formatText(site.site_id))}</div>
             </div>
             <strong>${escapeHtml(formatText(site.metric_display))}</strong>
           </div>
           <div class="site-card-bottom">
             <span class="site-meta">Coords ${escapeHtml(formatText(site.coordinates_text))}</span>
-            <span class="site-meta">Current ratio ${formatNumber(site.femaleadult_to_limit_ratio)}x</span>
+            <span class="site-meta">Current ratio ${formatRatio(site.femaleadult_to_limit_ratio)}</span>
           </div>
           <div class="result-actions">
             <button type="button" class="ghost-button compact" data-chat-site="${escapeHtml(site.site_id)}">Take me there</button>
@@ -1024,7 +1156,7 @@ function addMapLayers() {
     hoverPopup
       .setLngLat(feature.geometry.coordinates)
       .setHTML(`
-        <strong>${escapeHtml(feature.properties.sitename)}</strong>
+        <strong>${escapeHtml(feature.properties.displayName || feature.properties.sitename)}</strong>
         <div class="popup-line">${escapeHtml(feature.properties.productionarea)}</div>
         <div class="popup-line">${escapeHtml(feature.properties.metricLabel)}: ${escapeHtml(feature.properties.metricDisplay)}</div>
       `)
@@ -1049,7 +1181,7 @@ map.on("load", async () => {
   try {
     const dataset = await fetchSiteDataset();
     state.datasetMeta = dataset.metadata || {};
-    state.features = (dataset.features || []).map(normalizeFeature);
+    state.features = annotateDuplicateSiteNames((dataset.features || []).map(normalizeFeature));
     populateFilters();
     wireControls();
     renderSuggestionChips();
