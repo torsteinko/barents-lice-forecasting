@@ -1,0 +1,227 @@
+{
+  "config": {
+    "initial_weight_g": 50.0,
+    "beta": -0.3,
+    "optimum_temperature_c": 13.5,
+    "curvature": 0.018,
+    "target_sgr_percent": 1.53,
+    "reference_weight_g": 150.0,
+    "calibration_temperature_c": 14.0,
+    "days": 400,
+    "temperatures_c": [
+      4.0,
+      6.0,
+      8.0,
+      10.0,
+      12.0,
+      14.0,
+      16.0,
+      18.0,
+      20.0
+    ]
+  },
+  "calibrated_alpha": 6.87889703,
+  "curve_summary": [
+    {
+      "temperature_c": 4.0,
+      "temperature_label": "4C",
+      "final_weight_g": 194.537,
+      "mean_sgr_percent": 0.3396,
+      "max_daily_gain_g": 0.5421,
+      "day_to_500g": null,
+      "day_to_1000g": null
+    },
+    {
+      "temperature_c": 6.0,
+      "temperature_label": "6C",
+      "final_weight_g": 446.147,
+      "mean_sgr_percent": 0.5472,
+      "max_daily_gain_g": 1.7868,
+      "day_to_500g": null,
+      "day_to_1000g": null
+    },
+    {
+      "temperature_c": 8.0,
+      "temperature_label": "8C",
+      "final_weight_g": 1035.945,
+      "mean_sgr_percent": 0.7578,
+      "max_daily_gain_g": 5.1446,
+      "day_to_500g": 269,
+      "day_to_1000g": 393
+    },
+    {
+      "temperature_c": 10.0,
+      "temperature_label": "10C",
+      "final_weight_g": 2058.375,
+      "mean_sgr_percent": 0.9294,
+      "max_daily_gain_g": 11.5011,
+      "day_to_500g": 195,
+      "day_to_1000g": 285
+    },
+    {
+      "temperature_c": 12.0,
+      "temperature_label": "12C",
+      "final_weight_g": 3118.145,
+      "mean_sgr_percent": 1.0332,
+      "max_daily_gain_g": 18.4138,
+      "day_to_500g": 163,
+      "day_to_1000g": 238
+    },
+    {
+      "temperature_c": 14.0,
+      "temperature_label": "14C",
+      "final_weight_g": 3397.458,
+      "mean_sgr_percent": 1.0547,
+      "max_daily_gain_g": 20.27,
+      "day_to_500g": 157,
+      "day_to_1000g": 229
+    },
+    {
+      "temperature_c": 16.0,
+      "temperature_label": "16C",
+      "final_weight_g": 2633.584,
+      "mean_sgr_percent": 0.991,
+      "max_daily_gain_g": 15.2244,
+      "day_to_500g": 175,
+      "day_to_1000g": 255
+    },
+    {
+      "temperature_c": 18.0,
+      "temperature_label": "18C",
+      "final_weight_g": 1501.935,
+      "mean_sgr_percent": 0.8506,
+      "max_daily_gain_g": 7.9875,
+      "day_to_500g": 225,
+      "day_to_1000g": 329
+    },
+    {
+      "temperature_c": 20.0,
+      "temperature_label": "20C",
+      "final_weight_g": 686.592,
+      "mean_sgr_percent": 0.6549,
+      "max_daily_gain_g": 3.1084,
+      "day_to_500g": 334,
+      "day_to_1000g": null
+    }
+  ],
+  "ranked_by_final_weight": [
+    {
+      "temperature_c": 14.0,
+      "temperature_label": "14C",
+      "final_weight_g": 3397.458,
+      "mean_sgr_percent": 1.0547,
+      "max_daily_gain_g": 20.27,
+      "day_to_500g": 157,
+      "day_to_1000g": 229
+    },
+    {
+      "temperature_c": 12.0,
+      "temperature_label": "12C",
+      "final_weight_g": 3118.145,
+      "mean_sgr_percent": 1.0332,
+      "max_daily_gain_g": 18.4138,
+      "day_to_500g": 163,
+      "day_to_1000g": 238
+    },
+    {
+      "temperature_c": 16.0,
+      "temperature_label": "16C",
+      "final_weight_g": 2633.584,
+      "mean_sgr_percent": 0.991,
+      "max_daily_gain_g": 15.2244,
+      "day_to_500g": 175,
+      "day_to_1000g": 255
+    },
+    {
+      "temperature_c": 10.0,
+      "temperature_label": "10C",
+      "final_weight_g": 2058.375,
+      "mean_sgr_percent": 0.9294,
+      "max_daily_gain_g": 11.5011,
+      "day_to_500g": 195,
+      "day_to_1000g": 285
+    },
+    {
+      "temperature_c": 18.0,
+      "temperature_label": "18C",
+      "final_weight_g": 1501.935,
+      "mean_sgr_percent": 0.8506,
+      "max_daily_gain_g": 7.9875,
+      "day_to_500g": 225,
+      "day_to_1000g": 329
+    },
+    {
+      "temperature_c": 8.0,
+      "temperature_label": "8C",
+      "final_weight_g": 1035.945,
+      "mean_sgr_percent": 0.7578,
+      "max_daily_gain_g": 5.1446,
+      "day_to_500g": 269,
+      "day_to_1000g": 393
+    },
+    {
+      "temperature_c": 20.0,
+      "temperature_label": "20C",
+      "final_weight_g": 686.592,
+      "mean_sgr_percent": 0.6549,
+      "max_daily_gain_g": 3.1084,
+      "day_to_500g": 334,
+      "day_to_1000g": null
+    },
+    {
+      "temperature_c": 6.0,
+      "temperature_label": "6C",
+      "final_weight_g": 446.147,
+      "mean_sgr_percent": 0.5472,
+      "max_daily_gain_g": 1.7868,
+      "day_to_500g": null,
+      "day_to_1000g": null
+    },
+    {
+      "temperature_c": 4.0,
+      "temperature_label": "4C",
+      "final_weight_g": 194.537,
+      "mean_sgr_percent": 0.3396,
+      "max_daily_gain_g": 0.5421,
+      "day_to_500g": null,
+      "day_to_1000g": null
+    }
+  ],
+  "best_temperature_by_final_weight": {
+    "temperature_c": 14.0,
+    "temperature_label": "14C",
+    "final_weight_g": 3397.458,
+    "mean_sgr_percent": 1.0547,
+    "max_daily_gain_g": 20.27,
+    "day_to_500g": 157,
+    "day_to_1000g": 229
+  },
+  "validation": [
+    {
+      "name": "alpha_matches_stata_formula",
+      "passed": true,
+      "expected": 1.53,
+      "observed": 1.53
+    },
+    {
+      "name": "effective_14c_sgr_is_close_to_comment_target",
+      "passed": true,
+      "expected": 1.53,
+      "observed": 1.523130468039243,
+      "delta": -0.006869531960757014
+    },
+    {
+      "name": "all_weights_positive",
+      "passed": true
+    },
+    {
+      "name": "14c_outperforms_10c_and_18c",
+      "passed": true,
+      "observed": {
+        "10C": 2058.375,
+        "14C": 3397.458,
+        "18C": 1501.935
+      }
+    }
+  ]
+}
