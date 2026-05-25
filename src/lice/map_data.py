@@ -53,8 +53,14 @@ def write_site_map_geojson(
     predictions: pd.DataFrame,
     vtreatment: pd.DataFrame,
     path: Path,
+    history_master: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    site_map = build_site_map_frame(master, predictions, vtreatment)
+    site_map = build_site_map_frame(
+        master,
+        predictions,
+        vtreatment,
+        history_master=history_master,
+    )
     geojson = build_site_map_geojson(site_map)
     path.write_text(json.dumps(geojson, indent=2), encoding="utf-8")
     return site_map
@@ -64,22 +70,17 @@ def build_site_map_frame(
     master: pd.DataFrame,
     predictions: pd.DataFrame,
     vtreatment: pd.DataFrame,
+    history_master: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
+    history_master = master if history_master is None else history_master
     predictions = predictions.copy()
     predictions["week_start_date"] = pd.to_datetime(
         predictions["week_start_date"], errors="coerce"
     )
-    case_cutoff_date = _derive_case_cutoff_date(predictions)
-    if case_cutoff_date is not None:
-        master = master[master["week_start_date"] <= case_cutoff_date].copy()
-        vtreatment = vtreatment[
-            vtreatment["week_start_date"] <= case_cutoff_date
-        ].copy()
-        predictions = predictions[
-            predictions["week_start_date"] <= case_cutoff_date
-        ].copy()
-
     latest_status = _build_latest_status(master)
+    latest_counted_status = _build_latest_counted_status(history_master)
+    latest_raw_date = _derive_latest_raw_date(latest_status)
+    case_cutoff_date = _derive_case_cutoff_date(predictions)
     latest_treatment = _build_latest_treatment(vtreatment)
     prediction_snapshot = _build_prediction_snapshot(predictions)
 
@@ -95,6 +96,14 @@ def build_site_map_frame(
         how="left",
         validate="one_to_one",
     )
+    frame = frame.merge(
+        latest_counted_status,
+        on="sitenumber",
+        how="left",
+        validate="one_to_one",
+    )
+    frame = _apply_last_counted_metric_fallbacks(frame)
+    frame = _suppress_currently_inactive_forecasts(frame)
 
     classifier_score_columns = [
         column
@@ -106,6 +115,9 @@ def build_site_map_frame(
         if column in frame.columns
     ]
     if classifier_score_columns:
+        frame["forecast_available"] = (
+            frame[classifier_score_columns].notna().any(axis=1)
+        )
         score_frame = frame[classifier_score_columns]
         frame["max_breach_risk"] = score_frame.max(axis=1, skipna=True)
         best_score_column = score_frame.fillna(-np.inf).idxmax(axis=1)
@@ -115,17 +127,32 @@ def build_site_map_frame(
         )
         frame.loc[score_frame.isna().all(axis=1), "priority_horizon"] = None
     else:
+        frame["forecast_available"] = False
         frame["max_breach_risk"] = np.nan
         frame["priority_horizon"] = None
 
-    frame["current_limit_excess"] = (
-        frame["femaleadult"].fillna(0.0) - frame["licelimitweek"].fillna(np.inf)
-    ).clip(lower=0.0)
-    frame["currently_over_limit"] = np.where(
-        frame["overthelicelimitweek"].notna(),
-        frame["overthelicelimitweek"],
-        frame["femaleadult"].fillna(-np.inf) > frame["licelimitweek"].fillna(np.inf),
+    has_current_count = (
+        frame["havecountedlice"].fillna(False)
+        & frame["femaleadult"].notna()
+        & frame["licelimitweek"].notna()
     )
+    frame["current_limit_excess"] = (
+        frame["femaleadult"] - frame["licelimitweek"]
+    ).clip(lower=0.0)
+    frame["current_limit_excess"] = frame["current_limit_excess"].where(
+        has_current_count
+    )
+
+    frame["currently_over_limit"] = pd.Series(pd.NA, index=frame.index, dtype="boolean")
+    reported_over_limit = frame["overthelicelimitweek"].notna() & has_current_count
+    derived_over_limit = ~reported_over_limit & has_current_count
+    frame.loc[reported_over_limit, "currently_over_limit"] = frame.loc[
+        reported_over_limit, "overthelicelimitweek"
+    ].astype("boolean")
+    frame.loc[derived_over_limit, "currently_over_limit"] = (
+        frame.loc[derived_over_limit, "femaleadult"]
+        > frame.loc[derived_over_limit, "licelimitweek"]
+    ).astype("boolean")
     frame["risk_band"] = np.select(
         [
             frame["max_breach_risk"].fillna(0.0) >= 0.8,
@@ -146,9 +173,18 @@ def build_site_map_frame(
         ["max_breach_risk", "femaleadult_to_limit_ratio", "femaleadult"],
         ascending=[False, False, False],
     ).reset_index(drop=True)
+    if latest_raw_date is not None:
+        frame.attrs["latest_raw_date"] = latest_raw_date.date().isoformat()
+        frame.attrs["latest_raw_week_label"] = _format_timestamp_week_label(
+            latest_raw_date
+        )
     if case_cutoff_date is not None:
         frame.attrs["case_cutoff_date"] = case_cutoff_date.date().isoformat()
         frame.attrs["case_cutoff_week_label"] = _format_timestamp_week_label(
+            case_cutoff_date
+        )
+        frame.attrs["forecast_anchor_date"] = case_cutoff_date.date().isoformat()
+        frame.attrs["forecast_anchor_week_label"] = _format_timestamp_week_label(
             case_cutoff_date
         )
     return frame
@@ -159,6 +195,8 @@ def build_site_map_geojson(site_map: pd.DataFrame) -> dict[str, object]:
     property_columns = [
         column for column in site_map.columns if column not in {"latitude", "longitude"}
     ]
+    latest_raw_date = site_map.attrs.get("latest_raw_date")
+    latest_raw_week_label = site_map.attrs.get("latest_raw_week_label")
     case_cutoff_date = site_map.attrs.get("case_cutoff_date")
     case_cutoff_week_label = site_map.attrs.get("case_cutoff_week_label")
 
@@ -186,12 +224,26 @@ def build_site_map_geojson(site_map: pd.DataFrame) -> dict[str, object]:
         "type": "FeatureCollection",
         "metadata": {
             "feature_count": len(features),
-            "description": "Case snapshot capped at the prediction-supported cutoff date, with treatment context and holdout predictions aligned to the same case date.",
+            "description": "Site status comes from the latest raw reporting week, while forecast outputs stay anchored to the latest reliable scoring week.",
+            "latest_raw_date": latest_raw_date,
+            "latest_raw_week_label": latest_raw_week_label,
             "case_cutoff_date": case_cutoff_date,
             "case_cutoff_week_label": case_cutoff_week_label,
+            "forecast_anchor_date": case_cutoff_date,
+            "forecast_anchor_week_label": case_cutoff_week_label,
         },
         "features": features,
     }
+
+
+def _derive_latest_raw_date(master: pd.DataFrame) -> pd.Timestamp | None:
+    if master.empty or "week_start_date" not in master.columns:
+        return None
+
+    dated = master[master["week_start_date"].notna()].copy()
+    if dated.empty:
+        return None
+    return pd.to_datetime(dated["week_start_date"].max())
 
 
 def _derive_case_cutoff_date(predictions: pd.DataFrame) -> pd.Timestamp | None:
@@ -212,6 +264,90 @@ def _derive_case_cutoff_date(predictions: pd.DataFrame) -> pd.Timestamp | None:
     if latest_per_group.empty:
         return dated["week_start_date"].max()
     return pd.to_datetime(latest_per_group.min())
+
+
+def _build_latest_counted_status(master: pd.DataFrame) -> pd.DataFrame:
+    counted_columns = [
+        "sitenumber",
+        "year",
+        "week",
+        "week_start_date",
+        "seatemperature",
+        "mobilelice",
+        "persistentlice",
+    ]
+    counted_rows = master[master["havecountedlice"].fillna(False)].copy()
+    if counted_rows.empty:
+        return pd.DataFrame(
+            columns=[
+                "sitenumber",
+                "last_counted_year",
+                "last_counted_week",
+                "last_counted_date",
+                "last_counted_seatemperature",
+                "last_counted_mobilelice",
+                "last_counted_persistentlice",
+                "last_counted_week_label",
+            ]
+        )
+
+    latest_counted = (
+        counted_rows[counted_columns]
+        .sort_values(["sitenumber", "week_start_date"])
+        .groupby("sitenumber", as_index=False)
+        .tail(1)
+        .reset_index(drop=True)
+    )
+    latest_counted = latest_counted.rename(
+        columns={
+            "year": "last_counted_year",
+            "week": "last_counted_week",
+            "week_start_date": "last_counted_date",
+            "seatemperature": "last_counted_seatemperature",
+            "mobilelice": "last_counted_mobilelice",
+            "persistentlice": "last_counted_persistentlice",
+        }
+    )
+    latest_counted["last_counted_week_label"] = latest_counted.apply(
+        lambda row: _format_reporting_week_label(
+            row.get("last_counted_year"), row.get("last_counted_week")
+        ),
+        axis=1,
+    )
+    return latest_counted
+
+
+def _apply_last_counted_metric_fallbacks(frame: pd.DataFrame) -> pd.DataFrame:
+    frame = frame.copy()
+    fallback_pairs = {
+        "display_seatemperature": ("seatemperature", "last_counted_seatemperature"),
+        "display_mobilelice": ("mobilelice", "last_counted_mobilelice"),
+        "display_persistentlice": ("persistentlice", "last_counted_persistentlice"),
+    }
+
+    for display_column, (current_column, last_counted_column) in fallback_pairs.items():
+        frame[display_column] = frame[current_column].combine_first(
+            frame[last_counted_column]
+        )
+
+    return frame
+
+
+def _suppress_currently_inactive_forecasts(frame: pd.DataFrame) -> pd.DataFrame:
+    frame = frame.copy()
+    prediction_value_columns = [
+        column
+        for column in frame.columns
+        if (column.startswith("classifier_") and column.endswith("_score"))
+        or (column.startswith("count_") and column.endswith("_prediction"))
+    ]
+    if not prediction_value_columns:
+        return frame
+
+    currently_inactive = frame["likelynofish"].fillna(False)
+    if currently_inactive.any():
+        frame.loc[currently_inactive, prediction_value_columns] = np.nan
+    return frame
 
 
 def _build_latest_status(master: pd.DataFrame) -> pd.DataFrame:

@@ -142,8 +142,8 @@ def select_and_score_classifier(
 
     comparison_rows: list[dict[str, float | int | str | bool | None]] = []
     best_candidate: dict[str, object] | None = None
+    best_calibration_metrics: dict[str, float | None] | None = None
     best_threshold = 0.5
-    best_selection_score = -np.inf
 
     for candidate in build_classifier_candidates(horizon):
         candidate_name = str(candidate["name"])
@@ -179,9 +179,12 @@ def select_and_score_classifier(
                     "fit_error": None,
                 }
             )
-            if selection_score > best_selection_score:
-                best_selection_score = selection_score
+            if is_better_classifier_candidate(
+                calibration_metrics,
+                best_calibration_metrics,
+            ):
                 best_candidate = candidate
+                best_calibration_metrics = calibration_metrics
                 best_threshold = threshold
         except Exception as exc:
             comparison_rows.append(
@@ -205,6 +208,21 @@ def select_and_score_classifier(
 
     if best_candidate is None:
         raise ValueError(f"No classifier candidate available for {label_column}.")
+
+    preferred_candidate = maybe_promote_classifier_candidate(
+        comparison_rows,
+        best_candidate,
+        horizon,
+    )
+    if preferred_candidate is not None:
+        best_candidate = preferred_candidate
+        matching_rows = [
+            row
+            for row in comparison_rows
+            if row["candidate_model"] == best_candidate["name"]
+        ]
+        if matching_rows and matching_rows[0]["calibration_threshold"] is not None:
+            best_threshold = float(matching_rows[0]["calibration_threshold"])
 
     selected_model = clone(best_candidate["model"])
     fit_classifier_model(
@@ -424,7 +442,7 @@ def split_train_calibration_holdout(
 
 
 def build_classifier_candidates(horizon: int) -> list[dict[str, object]]:
-    hist_kwargs = {
+    hist_default_kwargs = {
         "random_state": RANDOM_SEED,
         "max_depth": 6,
         "max_iter": 250,
@@ -434,12 +452,12 @@ def build_classifier_candidates(horizon: int) -> list[dict[str, object]]:
     return [
         {
             "name": "hist_gb_default",
-            "model": HistGradientBoostingClassifier(**hist_kwargs),
+            "model": HistGradientBoostingClassifier(**hist_default_kwargs),
             "fit_mode": "standard",
         },
         {
             "name": "hist_gb_balanced",
-            "model": HistGradientBoostingClassifier(**hist_kwargs),
+            "model": HistGradientBoostingClassifier(**hist_default_kwargs),
             "fit_mode": "balanced_samples",
         },
         *build_xgb_classifier_candidates(horizon),
@@ -474,11 +492,11 @@ def build_regressor_candidates(horizon: int) -> list[dict[str, object]]:
 
 
 def build_xgb_classifier_candidates(horizon: int) -> list[dict[str, object]]:
-    if xgb is None or horizon < 12:
+    if xgb is None:
         return []
     return [
         {
-            "name": "xgb_gpu_balanced",
+            "name": "xgb_gpu_balanced_baseline",
             "model": xgb.XGBClassifier(
                 n_estimators=320,
                 max_depth=6,
@@ -494,7 +512,27 @@ def build_xgb_classifier_candidates(horizon: int) -> list[dict[str, object]]:
                 eval_metric="logloss",
             ),
             "fit_mode": "balanced_samples",
-        }
+        },
+        {
+            "name": "xgb_gpu_balanced_tuned",
+            "model": xgb.XGBClassifier(
+                n_estimators=420,
+                max_depth=5,
+                learning_rate=0.04,
+                subsample=0.85,
+                colsample_bytree=0.85,
+                min_child_weight=5,
+                reg_lambda=1.0,
+                gamma=0.0,
+                max_delta_step=2,
+                random_state=RANDOM_SEED,
+                tree_method="hist",
+                device="cuda",
+                objective="binary:logistic",
+                eval_metric="logloss",
+            ),
+            "fit_mode": "balanced_samples",
+        },
     ]
 
 
@@ -505,9 +543,9 @@ def build_xgb_regressor_candidates(horizon: int) -> list[dict[str, object]]:
         {
             "name": "xgb_gpu_poisson",
             "model": xgb.XGBRegressor(
-                n_estimators=320,
-                max_depth=6,
-                learning_rate=0.05,
+                n_estimators=420,
+                max_depth=5,
+                learning_rate=0.04,
                 subsample=0.85,
                 colsample_bytree=0.85,
                 min_child_weight=5,
@@ -518,7 +556,25 @@ def build_xgb_regressor_candidates(horizon: int) -> list[dict[str, object]]:
                 objective="count:poisson",
                 eval_metric="poisson-nloglik",
             ),
-        }
+        },
+        {
+            "name": "xgb_gpu_tweedie",
+            "model": xgb.XGBRegressor(
+                n_estimators=420,
+                max_depth=5,
+                learning_rate=0.04,
+                subsample=0.85,
+                colsample_bytree=0.85,
+                min_child_weight=5,
+                reg_lambda=1.0,
+                tweedie_variance_power=1.35,
+                random_state=RANDOM_SEED,
+                tree_method="hist",
+                device="cuda",
+                objective="reg:tweedie",
+                eval_metric="rmse",
+            ),
+        },
     ]
 
 
@@ -540,6 +596,70 @@ def fit_classifier_model(
         return
 
     model.fit(x_train, y_train)
+
+
+def is_better_classifier_candidate(
+    candidate_metrics: dict[str, float | None],
+    best_metrics: dict[str, float | None] | None,
+    f1_tolerance: float = 0.002,
+    pr_auc_tolerance: float = 0.002,
+) -> bool:
+    if best_metrics is None:
+        return True
+
+    candidate_f1 = float(candidate_metrics["f1"] or 0.0)
+    best_f1 = float(best_metrics["f1"] or 0.0)
+    if candidate_f1 > best_f1 + f1_tolerance:
+        return True
+    if candidate_f1 + f1_tolerance < best_f1:
+        return False
+
+    candidate_recall = float(candidate_metrics["recall"] or 0.0)
+    best_recall = float(best_metrics["recall"] or 0.0)
+    if candidate_recall > best_recall:
+        return True
+    if candidate_recall < best_recall:
+        return False
+
+    candidate_pr_auc = float(candidate_metrics["pr_auc"] or 0.0)
+    best_pr_auc = float(best_metrics["pr_auc"] or 0.0)
+    return candidate_pr_auc > best_pr_auc + pr_auc_tolerance
+
+
+def maybe_promote_classifier_candidate(
+    comparison_rows: list[dict[str, float | int | str | bool | None]],
+    best_candidate: dict[str, object],
+    horizon: int,
+) -> dict[str, object] | None:
+    preferred_by_horizon = {
+        2: ("hist_gb_balanced", 0.01),
+    }
+    preference = preferred_by_horizon.get(horizon)
+    if preference is None:
+        return None
+
+    preferred_name, max_f1_gap = preference
+    best_row = next(
+        row
+        for row in comparison_rows
+        if row["candidate_model"] == best_candidate["name"]
+    )
+    preferred_row = next(
+        (row for row in comparison_rows if row["candidate_model"] == preferred_name),
+        None,
+    )
+    if preferred_row is None or preferred_row["calibration_f1"] is None:
+        return None
+
+    best_f1 = float(best_row["calibration_f1"] or 0.0)
+    preferred_f1 = float(preferred_row["calibration_f1"] or 0.0)
+    if best_f1 - preferred_f1 > max_f1_gap:
+        return None
+
+    for candidate in build_classifier_candidates(horizon):
+        if candidate["name"] == preferred_name:
+            return candidate
+    return None
 
 
 def tune_decision_threshold(
