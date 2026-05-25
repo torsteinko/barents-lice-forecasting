@@ -31,10 +31,10 @@ const METRICS = {
   },
 };
 
-const RISK_FILTERS = ["all", "critical", "high", "watch", "stable"];
+const RISK_FILTERS = ["critical", "high", "watch", "stable", "unavailable"];
 const CHAT_SUGGESTIONS = [
   "Which site in Vestland has the biggest chance of outbreak the next 2 weeks?",
-  "Which visible sites are already above the lice limit right now?",
+  "Which sites are already above the lice limit right now?",
   "Show me the highest 12-week risk sites that were treated recently.",
 ];
 
@@ -54,11 +54,11 @@ const KPI_HELP = {
   latest_reporting_week:
     "The reporting week used for this site's current-status snapshot.",
   sea_temperature:
-    "Reported sea temperature for the latest reporting week. A dash means it was not reported that week.",
+    "Sea temperature from the latest reporting week when available. If that week was not reported, this falls back to the last counted week shown above.",
   mobile_lice:
-    "Reported mobile-stage lice level for the latest reporting week. A dash means it was not reported that week.",
+    "Mobile-stage lice from the latest reporting week when available. If that week was not reported, this falls back to the last counted week shown above.",
   persistent_lice:
-    "Reported persistent lice level for the latest reporting week. A dash means it was not reported that week.",
+    "Persistent lice from the latest reporting week when available. If that week was not reported, this falls back to the last counted week shown above.",
   counted_lice_this_week:
     "Whether the site submitted a lice count in the latest reporting week.",
   last_counted_week:
@@ -124,7 +124,7 @@ const state = {
   selectedId: null,
   datasetMeta: {},
   currentMetric: "near_term_risk",
-  riskFilter: "all",
+  riskFilters: new Set(RISK_FILTERS),
   area: "all",
   county: "all",
   query: "",
@@ -216,6 +216,13 @@ function formatBoolean(value) {
     return "--";
   }
   return value ? "Yes" : "No";
+}
+
+function pickSiteValue(site, preferredKey, fallbackKey) {
+  const preferredValue = site?.[preferredKey];
+  return preferredValue === null || preferredValue === undefined || preferredValue === ""
+    ? site?.[fallbackKey]
+    : preferredValue;
 }
 
 function renderKpiHelp(helpText) {
@@ -448,17 +455,41 @@ function renderMetricSwitcher() {
 
 function renderRiskFilter() {
   const container = document.getElementById("risk-filter-row");
-  container.innerHTML = RISK_FILTERS.map(
+  const allSelected = state.riskFilters.size === RISK_FILTERS.length;
+  const allButton = `
+    <button type="button" class="risk-chip ${allSelected ? "active" : ""}" data-risk="all" aria-pressed="${allSelected}">
+      All
+    </button>
+  `;
+
+  const riskButtons = RISK_FILTERS.map(
     (risk) => `
-      <button type="button" class="risk-chip ${state.riskFilter === risk ? "active" : ""}" data-risk="${risk}">
-        ${escapeHtml(risk === "all" ? "All" : formatStatusLabel(risk))}
+      <button type="button" class="risk-chip ${state.riskFilters.has(risk) ? "active" : ""}" data-risk="${risk}" aria-pressed="${state.riskFilters.has(risk)}">
+        ${escapeHtml(formatStatusLabel(risk))}
       </button>
     `,
   ).join("");
 
+  container.innerHTML = allButton + riskButtons;
+
   container.querySelectorAll("[data-risk]").forEach((button) => {
     button.addEventListener("click", () => {
-      state.riskFilter = button.dataset.risk;
+      const nextRisk = button.dataset.risk;
+      if (nextRisk === "all") {
+        state.riskFilters = new Set(RISK_FILTERS);
+      } else if (state.riskFilters.size === RISK_FILTERS.length) {
+        state.riskFilters = new Set([nextRisk]);
+      } else if (state.riskFilters.has(nextRisk)) {
+        if (state.riskFilters.size > 1) {
+          const nextFilters = new Set(state.riskFilters);
+          nextFilters.delete(nextRisk);
+          state.riskFilters = nextFilters;
+        }
+      } else {
+        const nextFilters = new Set(state.riskFilters);
+        nextFilters.add(nextRisk);
+        state.riskFilters = nextFilters;
+      }
       refreshView();
     });
   });
@@ -514,7 +545,7 @@ function filterSites() {
   const query = state.query.trim().toLowerCase();
   return state.features.filter((site) => {
     const siteRisk = riskBucket(metricValue(site));
-    const matchesRisk = state.riskFilter === "all" || siteRisk === state.riskFilter;
+    const matchesRisk = state.riskFilters.has(siteRisk);
     const matchesArea = state.area === "all" || site.productionarea === state.area;
     const matchesCounty = state.county === "all" || site.county === state.county;
     const matchesSearch =
@@ -642,7 +673,7 @@ function detailKpi(label, value, helpText = "") {
   return `
     <div class="detail-kpi">
       <div class="detail-kpi-head">
-        <span>${escapeHtml(label)}</span>
+        <span class="detail-kpi-label">${escapeHtml(label)}</span>
         ${renderKpiHelp(helpText)}
       </div>
       <strong>${escapeHtml(value)}</strong>
@@ -733,12 +764,12 @@ function forecastCard(site, horizon) {
   return `
     <div class="detail-kpi">
       <div class="detail-kpi-head">
-        <span>${horizon}w breach risk</span>
+        <span class="detail-kpi-label">${horizon}w breach risk</span>
         ${renderKpiHelp(helpText)}
       </div>
       <strong>${escapeHtml(formatPercent(scoreValue))}</strong>
       <span class="mini-pill ${risk}">${escapeHtml(formatStatusLabel(risk))}</span>
-      <span>${escapeHtml(scoreValue === null ? "No verified forecast available" : `Predicted count ${formatNumber(countValue)}`)}</span>
+      <span class="detail-kpi-subtext">${escapeHtml(scoreValue === null ? "No verified forecast available" : `Predicted count ${formatNumber(countValue)}`)}</span>
     </div>
   `;
 }
@@ -802,9 +833,9 @@ function renderDetailPanel(site) {
           <div class="detail-grid">
             ${detailKpi("Latest reporting week", formatWeekLabel(site.latest_reporting_week_label), KPI_HELP.latest_reporting_week)}
             ${detailKpi("Last counted week", formatWeekLabel(site.last_counted_week_label), KPI_HELP.last_counted_week)}
-            ${detailKpi("Sea temperature", formatNumber(site.seatemperature), KPI_HELP.sea_temperature)}
-            ${detailKpi("Mobile lice", formatNumber(site.mobilelice), KPI_HELP.mobile_lice)}
-            ${detailKpi("Persistent lice", formatNumber(site.persistentlice), KPI_HELP.persistent_lice)}
+            ${detailKpi("Sea temperature", formatNumber(pickSiteValue(site, "display_seatemperature", "seatemperature")), KPI_HELP.sea_temperature)}
+            ${detailKpi("Mobile lice", formatNumber(pickSiteValue(site, "display_mobilelice", "mobilelice")), KPI_HELP.mobile_lice)}
+            ${detailKpi("Persistent lice", formatNumber(pickSiteValue(site, "display_persistentlice", "persistentlice")), KPI_HELP.persistent_lice)}
             ${detailKpi("Counted lice this week", formatBoolean(site.havecountedlice), KPI_HELP.counted_lice_this_week)}
             ${detailKpi("Weeks since last count", formatNumber(site.weeks_since_last_counted, 0), KPI_HELP.weeks_since_last_count)}
             ${detailKpi("Likely no fish", formatBoolean(site.likelynofish), KPI_HELP.likely_no_fish)}
@@ -916,7 +947,7 @@ function setChatOpen(nextOpen) {
   drawer.classList.toggle("open", nextOpen);
   backdrop.classList.toggle("visible", nextOpen);
   openButton.classList.toggle("visible", !nextOpen);
-  toggleButton.textContent = nextOpen ? "Hide panel" : "Open panel";
+  toggleButton.textContent = nextOpen ? "Hide" : "Open panel";
 
   if (nextOpen) {
     document.getElementById("chat-input").focus();
@@ -991,27 +1022,56 @@ function renderSuggestionChips() {
   });
 }
 
+function buildChatSiteMetricSummary(site, payload) {
+  const metricLabel = formatText(site.metric_label || payload.metric_label || payload.metric_key || "Metric");
+  const metricValue = formatText(site.metric_display);
+  return { metricLabel, metricValue };
+}
+
+function buildChatSiteStatusSummary(site, payload) {
+  if (payload.metric_key === "femaleadult_to_limit_ratio") {
+    return `Current raw-week ratio ${formatRatio(site.femaleadult_to_limit_ratio)}`;
+  }
+  const currentRatio = formatRatio(site.femaleadult_to_limit_ratio);
+  if (currentRatio !== "--") {
+    return `Current ratio ${currentRatio}`;
+  }
+  const latestWeek = formatWeekLabel(site.latest_reporting_week_label);
+  const lastCountedWeek = formatWeekLabel(site.last_counted_week_label);
+  if (latestWeek !== "--" && lastCountedWeek !== "--" && latestWeek !== lastCountedWeek) {
+    return `Current ratio not reported in ${latestWeek}; last counted ${lastCountedWeek}`;
+  }
+  return "Current ratio --";
+}
+
 function renderChatResult(payload) {
   const siteCards = (payload.sites || [])
     .map(
-      (site) => `
+      (site) => {
+        const metricSummary = buildChatSiteMetricSummary(site, payload);
+        const statusSummary = buildChatSiteStatusSummary(site, payload);
+        return `
         <article class="result-card">
           <div class="result-card-top">
             <div>
               <strong>${escapeHtml(buildSiteDisplayName(site))}</strong>
               <div class="site-meta">${escapeHtml(formatText(site.municipality))} | ${escapeHtml(formatText(site.county))} | Site ${escapeHtml(formatText(site.site_id))}</div>
             </div>
-            <strong>${escapeHtml(formatText(site.metric_display))}</strong>
+            <div class="result-card-metric">
+              <span class="site-meta">${escapeHtml(metricSummary.metricLabel)}</span>
+              <strong>${escapeHtml(metricSummary.metricValue)}</strong>
+            </div>
           </div>
           <div class="site-card-bottom">
             <span class="site-meta">Coords ${escapeHtml(formatText(site.coordinates_text))}</span>
-            <span class="site-meta">Current ratio ${formatRatio(site.femaleadult_to_limit_ratio)}</span>
+            <span class="site-meta">${escapeHtml(statusSummary)}</span>
           </div>
           <div class="result-actions">
             <button type="button" class="ghost-button compact" data-chat-site="${escapeHtml(site.site_id)}">Take me there</button>
           </div>
         </article>
-      `,
+      `;
+      },
     )
     .join("");
 
@@ -1020,7 +1080,7 @@ function renderChatResult(payload) {
     `
       <div class="message-row">
         <strong>Atlas assistant</strong>
-        <span class="badge">${payload.used_llm ? "Gemini" : "Fallback"}</span>
+        <span class="badge">${payload.used_llm ? "Gemini" : "Error"}</span>
       </div>
       <div class="message-copy">${renderMarkdown(payload.answer)}</div>
       ${payload.proxy_note ? `<div class="popup-line">${escapeHtml(payload.proxy_note)}</div>` : ""}
@@ -1033,9 +1093,9 @@ function renderChatResult(payload) {
   if (payload.used_llm) {
     syncChatStatus(`Gemini live on Vertex: ${llm.model || "configured model"}.`);
   } else if (llm.last_error) {
-    syncChatStatus(`Fallback mode: ${llm.last_error}`);
+    syncChatStatus(`Gemini request failed: ${llm.last_error}`);
   } else {
-    syncChatStatus("Fallback mode: deterministic site ranking.");
+    syncChatStatus("Gemini is unavailable.");
   }
 
   document.querySelectorAll("[data-chat-site]").forEach((button) => {
@@ -1051,7 +1111,7 @@ function appendLoadingMessage() {
         <strong>Atlas assistant</strong>
         <span class="badge">Thinking</span>
       </div>
-      <div class="message-copy"><p>Looking through the visible sites and preparing the answer.</p></div>
+      <div class="message-copy"><p>Querying Gemini against the current site snapshot and historical tables.</p></div>
     `,
   );
 }
@@ -1063,7 +1123,7 @@ function removeLastLoadingMessage() {
   if (!last) {
     return;
   }
-  if (last.textContent.includes("Looking through the visible sites")) {
+  if (last.textContent.includes("Querying Gemini against the current site snapshot and historical tables")) {
     last.remove();
   }
 }
@@ -1089,7 +1149,7 @@ async function submitChat(message) {
     renderChatResult(payload);
   } catch (error) {
     removeLastLoadingMessage();
-    syncChatStatus("Chat request failed.");
+    syncChatStatus("Gemini request failed.");
     appendChatMessage(
       "assistant",
       `<div class="message-copy"><p>Chat request failed: ${escapeHtml(error.message)}</p><p>If the viewer is running from a static file server, start the FastAPI app with <code>python run_web.py</code> so the backend is available at <code>${escapeHtml(API_BASE || window.location.origin)}</code>.</p></div>`,
@@ -1136,7 +1196,7 @@ function wireControls() {
 
   document.getElementById("reset-filters-button").addEventListener("click", () => {
     state.currentMetric = "near_term_risk";
-    state.riskFilter = "all";
+    state.riskFilters = new Set(RISK_FILTERS);
     state.area = "all";
     state.county = "all";
     state.query = "";
@@ -1285,8 +1345,8 @@ map.on("load", async () => {
     renderCaseDate();
     syncChatStatus(
       API_BASE
-        ? `Gemini on Vertex when available. Backend: ${API_BASE}.`
-        : "Gemini on Vertex when available, with rule-based reasoning as a fallback.",
+        ? `Gemini on Vertex. Backend: ${API_BASE}.`
+        : "Gemini on Vertex only. Start the backend to enable chat.",
     );
     setChatOpen(false);
     refreshView({ fitBounds: true });

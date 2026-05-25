@@ -52,6 +52,7 @@ def main() -> None:
         predictions,
         vtreatment,
         LATEST_SITE_MAP_PATH,
+        history_master=master,
     )
     site_map.to_csv(LATEST_SITE_SNAPSHOT_PATH, index=False)
 

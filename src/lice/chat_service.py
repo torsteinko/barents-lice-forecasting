@@ -52,6 +52,14 @@ except ImportError:
 DEFAULT_CHAT_MODEL = "gemini-3.1-flash-lite"
 DEFAULT_SITE_CARD_METRIC = "near_term_risk"
 DEFAULT_SQL_TOP_K = 10
+SITE_CARD_METRIC_LABELS = {
+    "near_term_risk": "Near-term breach risk",
+    "classifier_1w_score": "1-week breach risk",
+    "classifier_2w_score": "2-week breach risk",
+    "classifier_12w_score": "12-week breach risk",
+    "femaleadult_to_limit_ratio": "Current raw-week ratio",
+    "currently_over_limit": "Currently over limit",
+}
 READ_ONLY_ALLOWED_LEADING_KEYWORDS = {"select", "with"}
 READ_ONLY_BLOCKED_KEYWORDS = {
     "alter",
@@ -109,7 +117,7 @@ if BaseQuerySQLDatabaseTool is not None and BaseSQLDatabaseToolkit is not None:
         name: str = "sql_db_query"
         description: str = (
             "Execute exactly one read-only SELECT or WITH SQL query against the database. "
-            "Only the master_table and visible_master_table views are allowed. "
+            "Only the master_table and site_snapshot relations are allowed. "
             "If an error is returned, rewrite the query, re-check it, and try again."
         )
 
@@ -169,6 +177,8 @@ class SiteChatService:
         self._cached_extractor: Any | None = None
         self._last_llm_error: str | None = None
         self._case_cutoff_date: pd.Timestamp | None = None
+        self._latest_raw_week_label: str | None = None
+        self._forecast_anchor_week_label: str | None = None
         self._active_geojson_path: Path | None = None
         self._active_master_table_path: Path | None = None
 
@@ -208,7 +218,7 @@ class SiteChatService:
         )
         return {
             "provider": (
-                "vertex-gemini" if ChatVertexAI is not None else "fallback-only"
+                "vertex-gemini" if ChatVertexAI is not None else "gemini-unavailable"
             ),
             "configured": configured,
             "project": project,
@@ -265,12 +275,20 @@ class SiteChatService:
             )
 
         self._last_llm_error = None
+        metric_key = _infer_site_card_metric(message_text)
+        agent_message = _augment_chat_question(message_text)
         engine = None
         try:
             engine = self._create_duckdb_engine()
             database = self._create_sql_database(engine)
-            raw_output = self._run_sql_agent(message_text, database)
-            parsed = self._parse_agent_result(message_text, raw_output)
+            raw_output = self._run_sql_agent(agent_message, database)
+            parsed = self._parse_agent_result(agent_message, raw_output)
+            if _looks_like_interrupted_answer(parsed.answer):
+                retry_message = _build_retry_chat_question(message_text)
+                retry_output = self._run_sql_agent(retry_message, database)
+                retry_parsed = self._parse_agent_result(retry_message, retry_output)
+                if not _looks_like_interrupted_answer(retry_parsed.answer):
+                    parsed = retry_parsed
         except Exception as exc:
             self._last_llm_error = _truncate_error(exc)
             return self._build_failure_response(
@@ -285,11 +303,13 @@ class SiteChatService:
         return {
             "answer": parsed.answer,
             "used_llm": True,
-            "metric_key": DEFAULT_SITE_CARD_METRIC,
-            "metric_label": "current snapshot context",
+            "metric_key": metric_key,
+            "metric_label": SITE_CARD_METRIC_LABELS.get(
+                metric_key, "Current snapshot context"
+            ),
             "filters_applied": [],
             "proxy_note": None,
-            "sites": self._hydrate_sites(parsed.sitenumbers),
+            "sites": self._hydrate_sites(parsed.sitenumbers, metric_key),
             "llm": self.get_llm_status(),
         }
 
@@ -330,6 +350,7 @@ class SiteChatService:
             return
 
         geojson = json.loads(geojson_path.read_text(encoding="utf-8"))
+        metadata = geojson.get("metadata", {}) if isinstance(geojson, dict) else {}
         case_cutoff_date = _parse_case_cutoff_date(geojson)
         records: list[dict[str, object]] = []
         for feature in geojson.get("features", []):
@@ -431,6 +452,16 @@ class SiteChatService:
         self._cached_parquet_columns = parquet_columns
         self._parquet_schema_error = parquet_schema_error
         self._case_cutoff_date = case_cutoff_date
+        self._latest_raw_week_label = _safe_metadata_text(
+            metadata.get("latest_raw_week_label")
+            if isinstance(metadata, dict)
+            else None
+        )
+        self._forecast_anchor_week_label = _safe_metadata_text(
+            metadata.get("forecast_anchor_week_label")
+            if isinstance(metadata, dict)
+            else None
+        )
         self._active_geojson_path = geojson_path
         self._active_master_table_path = master_table_path
 
@@ -451,15 +482,27 @@ class SiteChatService:
         parquet_path = master_table_path.resolve().as_posix()
         with engine.begin() as connection:
             connection.exec_driver_sql(self._build_master_view_sql(parquet_path))
-            connection.exec_driver_sql(self._build_visible_view_sql())
+            self._build_site_snapshot_sql_frame().to_sql(
+                "site_snapshot",
+                connection,
+                if_exists="replace",
+                index=False,
+            )
 
         return SQLDatabase(
             engine=engine,
-            include_tables=["master_table"],
+            include_tables=["master_table", "site_snapshot"],
             view_support=True,
             sample_rows_in_table_info=2,
             max_string_length=500,
         )
+
+    def _build_site_snapshot_sql_frame(self) -> pd.DataFrame:
+        if self._cached_frame is None:
+            return pd.DataFrame()
+
+        frame = self._cached_frame.copy().astype(object)
+        return frame.where(pd.notna(frame), None)
 
     def _build_master_view_sql(self, parquet_path: str) -> str:
         where_clause = self._build_case_cutoff_where_clause()
@@ -478,12 +521,6 @@ class SiteChatService:
         if "year" in self._cached_parquet_columns:
             return " WHERE CAST(year AS INTEGER) <= 2025"
         return ""
-
-    def _build_visible_view_sql(self) -> str:
-        return (
-            "CREATE OR REPLACE VIEW visible_master_table AS "
-            "SELECT * FROM master_table"
-        )
 
     def _run_sql_agent(
         self,
@@ -527,13 +564,18 @@ class SiteChatService:
             "You MUST use the SQL checker tool before executing a query. If a query returns an error, rewrite it and try again.\n\n"
             "Security and scope rules:\n"
             "- The database is read-only. Never attempt INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, COPY, EXPORT, ATTACH, DETACH, INSTALL, LOAD, SET, PRAGMA, or any other write or admin statement.\n"
-            "- Use the master_table view for all analysis. It already contains the full latest scored dataset across all sites.\n"
-            f"- Case cutoff: {cutoff_text}. Treat any data after that cutoff as out of scope.\n\n"
+            "- Use site_snapshot for questions about right now, current status, the latest raw reporting week, current ratios, current counts, or current forecast cards. site_snapshot has one row per site.\n"
+            "- Use master_table for historical site-week analysis, trends, or week-by-week reasoning across time.\n"
+            f"- master_table is capped at the forecast anchor date {cutoff_text}. Treat any later week-level history as out of scope in master_table.\n"
+            "- site_snapshot can be newer than master_table because it reflects the latest raw operational week plus the current forecast snapshot.\n\n"
+            "- No visible-only site subset is provided to chat in this build. If the user says visible sites, interpret that as the full current site_snapshot and answer from the available data instead of claiming the search was interrupted.\n"
+            "- For questions about sites already above the lice limit right now, use currently_over_limit from site_snapshot. If no rows match, answer that there are currently no sites identified as above the lice limit in the latest site snapshot.\n\n"
             "When you are done, your final answer MUST be a valid JSON object with this exact shape: "
             '{{"answer":"...","sitenumbers":["12345","67890"]}}.\n'
             "- The answer field must contain the user-facing answer text.\n"
             "- The sitenumbers field must contain only relevant sitenumber values from the database, converted to strings. Use an empty list when no sites are relevant.\n"
             "- Do not wrap the final JSON in code fences.\n"
+            "- Never say the search was interrupted or ask the user to try again unless the database genuinely has no relevant rows.\n"
             '- If the question is unrelated to the database, return JSON with answer set to "I don\'t know" and an empty sitenumbers list.'
         )
 
@@ -545,6 +587,15 @@ class SiteChatService:
 
     def _build_agent_input(self, message: str) -> str:
         parts = [f"User question: {message}"]
+        if self._latest_raw_week_label:
+            parts.append(
+                f"Latest raw site snapshot week: {self._latest_raw_week_label}."
+            )
+        if self._forecast_anchor_week_label:
+            parts.append(f"Forecast anchor week: {self._forecast_anchor_week_label}.")
+        parts.append(
+            "Use site_snapshot for current/latest/right-now questions. Use master_table for historical weekly questions."
+        )
         parts.append(
             "Return only the final JSON object when you have enough information."
         )
@@ -606,7 +657,11 @@ class SiteChatService:
             answer = raw_output.strip() or "I couldn't produce a usable answer."
             return AgentResultPayload(answer=answer, sitenumbers=[])
 
-    def _hydrate_sites(self, sitenumbers: Sequence[str]) -> list[dict[str, object]]:
+    def _hydrate_sites(
+        self,
+        sitenumbers: Sequence[str],
+        metric_key: str,
+    ) -> list[dict[str, object]]:
         if self._cached_site_index is None or self._cached_site_index.empty:
             return []
 
@@ -618,7 +673,7 @@ class SiteChatService:
             row = self._cached_site_index.loc[site_id]
             if isinstance(row, pd.DataFrame):
                 row = row.iloc[0]
-            site_cards.append(self._serialize_site(row, DEFAULT_SITE_CARD_METRIC))
+            site_cards.append(self._serialize_site(row, metric_key))
             seen.add(site_id)
         return site_cards
 
@@ -693,6 +748,9 @@ class SiteChatService:
             "metric_key": metric_key,
             "metric_value": _jsonify(metric_value),
             "metric_display": _format_metric_value(metric_key, metric_value),
+            "metric_label": SITE_CARD_METRIC_LABELS.get(
+                metric_key, "Current snapshot context"
+            ),
             "femaleadult": _jsonify(row.get("femaleadult")),
             "femaleadult_to_limit_ratio": _jsonify(
                 row.get("femaleadult_to_limit_ratio")
@@ -710,6 +768,7 @@ class SiteChatService:
             "latest_reporting_week_label": _jsonify(
                 row.get("latest_reporting_week_label")
             ),
+            "last_counted_week_label": _jsonify(row.get("last_counted_week_label")),
             "last_treatment_week_label": _jsonify(row.get("last_treatment_week_label")),
             "last_treatment_action": _jsonify(row.get("last_treatment_action")),
             "last_treatment_activeingredient": _jsonify(
@@ -750,7 +809,7 @@ def _validate_read_only_query(query: str) -> str | None:
     if blocked_function is not None:
         return f"The query contains a blocked function: {blocked_function.group(1)}."
 
-    allowed_relations = {"master_table", "visible_master_table"}
+    allowed_relations = {"master_table", "site_snapshot"}
     cte_normalized = normalized.replace("with recursive ", "with ")
     cte_names = {
         match.group(1)
@@ -766,7 +825,7 @@ def _validate_read_only_query(query: str) -> str | None:
             continue
         relation_name = candidate.split(".")[-1].strip('"')
         if relation_name not in allowed_relations:
-            return "Queries may only read from the master_table or visible_master_table views."
+            return "Queries may only read from the master_table or site_snapshot relations."
 
     return None
 
@@ -861,6 +920,11 @@ def _quote_sql_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def _safe_metadata_text(value: object) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+
 def _parse_case_cutoff_date(geojson: dict[str, object]) -> pd.Timestamp | None:
     metadata = geojson.get("metadata", {}) if isinstance(geojson, dict) else {}
     raw_value = metadata.get("case_cutoff_date") if isinstance(metadata, dict) else None
@@ -895,6 +959,77 @@ def _format_metric_value(metric_key: str, value: object) -> str:
     if metric_key.endswith("ratio"):
         return f"{numeric:.2f}x"
     return f"{numeric:.2f}"
+
+
+def _augment_chat_question(message: str) -> str:
+    normalized = str(message or "").strip()
+    if not normalized:
+        return normalized
+
+    notes: list[str] = []
+    lowered = normalized.lower()
+    if "visible" in lowered:
+        notes.append(
+            "Clarification: chat does not receive a visible-only map subset in this build, so interpret visible sites as the full current site_snapshot."
+        )
+    if (
+        "above the lice limit" in lowered
+        or "over the lice limit" in lowered
+        or "already above" in lowered
+    ):
+        notes.append(
+            "Clarification: for right-now lice-limit questions, use currently_over_limit from site_snapshot. If no rows match, answer that there are currently no sites identified as above the lice limit in the latest site snapshot."
+        )
+    if not notes:
+        return normalized
+    return normalized + "\n\n" + "\n".join(notes)
+
+
+def _build_retry_chat_question(message: str) -> str:
+    base = _augment_chat_question(message)
+    retry_note = (
+        "Retry instruction: answer directly from the available tables. Do not claim the search was interrupted. "
+        "If the user asks about visible sites, answer from site_snapshot across all sites in the current snapshot. "
+        "If no rows match currently_over_limit, say there are currently no sites identified as above the lice limit in the latest site snapshot."
+    )
+    return base + "\n\n" + retry_note
+
+
+def _looks_like_interrupted_answer(answer: str) -> bool:
+    text = str(answer or "").strip().lower()
+    if not text:
+        return True
+    interruption_markers = [
+        "search process was interrupted",
+        "please try your request again",
+        "could not retrieve the information",
+        "i am sorry, but i could not retrieve",
+    ]
+    return any(marker in text for marker in interruption_markers)
+
+
+def _infer_site_card_metric(message: str) -> str:
+    normalized = str(message or "").strip().lower()
+    if not normalized:
+        return DEFAULT_SITE_CARD_METRIC
+    if "ratio" in normalized or "to limit" in normalized:
+        return "femaleadult_to_limit_ratio"
+    if (
+        "currently over limit" in normalized
+        or "above the limit" in normalized
+        or "above the lice limit" in normalized
+        or "over the lice limit" in normalized
+    ):
+        return "currently_over_limit"
+    if "12w" in normalized or "12-week" in normalized or "12 week" in normalized:
+        return "classifier_12w_score"
+    if "2w" in normalized or "2-week" in normalized or "2 week" in normalized:
+        return "classifier_2w_score"
+    if "1w" in normalized or "1-week" in normalized or "1 week" in normalized:
+        return "classifier_1w_score"
+    if "near-term" in normalized or "near term" in normalized:
+        return "near_term_risk"
+    return DEFAULT_SITE_CARD_METRIC
 
 
 def _truncate_error(exc: Exception) -> str:

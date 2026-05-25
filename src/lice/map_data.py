@@ -53,8 +53,14 @@ def write_site_map_geojson(
     predictions: pd.DataFrame,
     vtreatment: pd.DataFrame,
     path: Path,
+    history_master: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    site_map = build_site_map_frame(master, predictions, vtreatment)
+    site_map = build_site_map_frame(
+        master,
+        predictions,
+        vtreatment,
+        history_master=history_master,
+    )
     geojson = build_site_map_geojson(site_map)
     path.write_text(json.dumps(geojson, indent=2), encoding="utf-8")
     return site_map
@@ -64,12 +70,15 @@ def build_site_map_frame(
     master: pd.DataFrame,
     predictions: pd.DataFrame,
     vtreatment: pd.DataFrame,
+    history_master: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
+    history_master = master if history_master is None else history_master
     predictions = predictions.copy()
     predictions["week_start_date"] = pd.to_datetime(
         predictions["week_start_date"], errors="coerce"
     )
     latest_status = _build_latest_status(master)
+    latest_counted_status = _build_latest_counted_status(history_master)
     latest_raw_date = _derive_latest_raw_date(latest_status)
     case_cutoff_date = _derive_case_cutoff_date(predictions)
     latest_treatment = _build_latest_treatment(vtreatment)
@@ -87,7 +96,13 @@ def build_site_map_frame(
         how="left",
         validate="one_to_one",
     )
-    frame = _annotate_last_counted_week(frame)
+    frame = frame.merge(
+        latest_counted_status,
+        on="sitenumber",
+        how="left",
+        validate="one_to_one",
+    )
+    frame = _apply_last_counted_metric_fallbacks(frame)
     frame = _suppress_currently_inactive_forecasts(frame)
 
     classifier_score_columns = [
@@ -251,18 +266,70 @@ def _derive_case_cutoff_date(predictions: pd.DataFrame) -> pd.Timestamp | None:
     return pd.to_datetime(latest_per_group.min())
 
 
-def _annotate_last_counted_week(frame: pd.DataFrame) -> pd.DataFrame:
+def _build_latest_counted_status(master: pd.DataFrame) -> pd.DataFrame:
+    counted_columns = [
+        "sitenumber",
+        "year",
+        "week",
+        "week_start_date",
+        "seatemperature",
+        "mobilelice",
+        "persistentlice",
+    ]
+    counted_rows = master[master["havecountedlice"].fillna(False)].copy()
+    if counted_rows.empty:
+        return pd.DataFrame(
+            columns=[
+                "sitenumber",
+                "last_counted_year",
+                "last_counted_week",
+                "last_counted_date",
+                "last_counted_seatemperature",
+                "last_counted_mobilelice",
+                "last_counted_persistentlice",
+                "last_counted_week_label",
+            ]
+        )
+
+    latest_counted = (
+        counted_rows[counted_columns]
+        .sort_values(["sitenumber", "week_start_date"])
+        .groupby("sitenumber", as_index=False)
+        .tail(1)
+        .reset_index(drop=True)
+    )
+    latest_counted = latest_counted.rename(
+        columns={
+            "year": "last_counted_year",
+            "week": "last_counted_week",
+            "week_start_date": "last_counted_date",
+            "seatemperature": "last_counted_seatemperature",
+            "mobilelice": "last_counted_mobilelice",
+            "persistentlice": "last_counted_persistentlice",
+        }
+    )
+    latest_counted["last_counted_week_label"] = latest_counted.apply(
+        lambda row: _format_reporting_week_label(
+            row.get("last_counted_year"), row.get("last_counted_week")
+        ),
+        axis=1,
+    )
+    return latest_counted
+
+
+def _apply_last_counted_metric_fallbacks(frame: pd.DataFrame) -> pd.DataFrame:
     frame = frame.copy()
-    frame["last_counted_date"] = pd.NaT
-    has_last_count = (
-        frame["week_start_date"].notna() & frame["weeks_since_last_counted"].notna()
-    )
-    frame.loc[has_last_count, "last_counted_date"] = pd.to_datetime(
-        frame.loc[has_last_count, "week_start_date"]
-    ) - pd.to_timedelta(frame.loc[has_last_count, "weeks_since_last_counted"], unit="W")
-    frame["last_counted_week_label"] = frame["last_counted_date"].apply(
-        _format_timestamp_week_label
-    )
+    fallback_pairs = {
+        "display_seatemperature": ("seatemperature", "last_counted_seatemperature"),
+        "display_mobilelice": ("mobilelice", "last_counted_mobilelice"),
+        "display_persistentlice": ("persistentlice", "last_counted_persistentlice"),
+    }
+
+    for display_column, (current_column, last_counted_column) in fallback_pairs.items():
+        frame[display_column] = frame[current_column].combine_first(
+            frame[last_counted_column]
+        )
+
     return frame
 
 
