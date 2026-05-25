@@ -283,6 +283,7 @@ class SiteChatService:
             database = self._create_sql_database(engine)
             raw_output = self._run_sql_agent(agent_message, database)
             parsed = self._parse_agent_result(agent_message, raw_output)
+            # Retry once when the agent returns interruption boilerplate instead of a grounded answer.
             if _looks_like_interrupted_answer(parsed.answer):
                 retry_message = _build_retry_chat_question(message_text)
                 retry_output = self._run_sql_agent(retry_message, database)
@@ -300,6 +301,7 @@ class SiteChatService:
             if engine is not None:
                 engine.dispose()
 
+        # Strip recurring schema jargon before returning text to the frontend.
         answer_text = _simplify_answer_text(parsed.answer)
 
         return {
@@ -341,6 +343,7 @@ class SiteChatService:
         parquet_mtime = (
             master_table_path.stat().st_mtime if master_table_path.exists() else None
         )
+        # Rebuild cached frames only when either backing artifact changed.
         if (
             self._cached_geojson is not None
             and self._cached_frame is not None
@@ -410,6 +413,7 @@ class SiteChatService:
             for column in ["classifier_1w_score", "classifier_2w_score"]
             if column in frame.columns
         ]
+        # The viewer treats the highest short-horizon breach probability as the near-term signal.
         frame["near_term_risk"] = (
             frame[near_term_columns].max(axis=1, skipna=True)
             if near_term_columns
@@ -483,6 +487,8 @@ class SiteChatService:
         )
         parquet_path = master_table_path.resolve().as_posix()
         with engine.begin() as connection:
+            # Keep the historical relation as a DuckDB view over parquet and materialize the
+            # latest site snapshot separately so the agent can answer current-state questions.
             connection.exec_driver_sql(self._build_master_view_sql(parquet_path))
             self._build_site_snapshot_sql_frame().to_sql(
                 "site_snapshot",
@@ -518,6 +524,8 @@ class SiteChatService:
             self._case_cutoff_date is not None
             and "week_start_date" in self._cached_parquet_columns
         ):
+            # Historical chat stays anchored to the validated forecast window even when the
+            # raw site snapshot has moved on to a newer incomplete reporting week.
             cutoff = self._case_cutoff_date.date().isoformat()
             return f" WHERE CAST(week_start_date AS DATE) <= DATE {_quote_sql_literal(cutoff)}"
         if "year" in self._cached_parquet_columns:
@@ -662,6 +670,8 @@ class SiteChatService:
             return _coerce_agent_payload(parsed_payload, raw_output)
 
         try:
+            # Fall back to structured extraction when the agent answers correctly in prose
+            # but misses the required JSON envelope.
             extracted = self._get_output_extractor().invoke(
                 "Extract the final user-facing answer and relevant sitenumbers from the SQL agent output below. "
                 "Only include sitenumbers that are explicitly supported by the output.\n\n"
@@ -827,6 +837,7 @@ def _validate_read_only_query(query: str) -> str | None:
 
     allowed_relations = {"master_table", "site_snapshot"}
     cte_normalized = normalized.replace("with recursive ", "with ")
+    # Let the agent reference its own CTE aliases without opening access to other tables.
     cte_names = {
         match.group(1)
         for match in re.finditer(
@@ -852,6 +863,7 @@ def _strip_sql_comments(query: str) -> str:
 
 
 def _load_json_like_payload(text: str) -> dict[str, Any] | None:
+    # The agent may wrap the final JSON in prose or fences, so probe a few likely slices.
     candidates = [text.strip()]
     candidates.extend(
         match.strip()
@@ -1000,7 +1012,11 @@ def _augment_chat_question(message: str) -> str:
         notes.append(
             "Clarification: this is a historical trend question. Use master_table, compare the last 3 observed weeks against the preceding 3 observed weeks by production area among counted rows, define pressure using the average adult-female-lice-to-limit ratio, and rank areas by the size of the positive change. List only areas with a positive change. Do not answer from site_snapshot forecast risk."
         )
-    if "before breaches" in lowered or "before a breach" in lowered or "before breach" in lowered:
+    if (
+        "before breaches" in lowered
+        or "before a breach" in lowered
+        or "before breach" in lowered
+    ):
         notes.append(
             "Clarification: this is a historical pre-breach analysis question. Use master_table and compare breach site-weeks to the preceding observed week or weeks for the same sites."
         )
@@ -1072,6 +1088,7 @@ def _simplify_answer_text(answer: str) -> str:
     if not text:
         return text
 
+    # Translate recurring schema and metric names into UI-facing language.
     replacements = [
         (r"\bmaster_table\b", "historical data"),
         (r"\bsite_snapshot\b", "current snapshot"),
@@ -1128,8 +1145,18 @@ def _simplify_answer_text(answer: str) -> str:
         text,
         flags=re.I,
     )
-    text = re.sub(r"Based on the historical (analysis|aggregation) of the historical data(?: for [^,]+)?,\s*", "", text, flags=re.I)
-    text = re.sub(r"Based on the historical (analysis|aggregation) of the current snapshot(?: for [^,]+)?,\s*", "", text, flags=re.I)
+    text = re.sub(
+        r"Based on the historical (analysis|aggregation) of the historical data(?: for [^,]+)?,\s*",
+        "",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        r"Based on the historical (analysis|aggregation) of the current snapshot(?: for [^,]+)?,\s*",
+        "",
+        text,
+        flags=re.I,
+    )
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
