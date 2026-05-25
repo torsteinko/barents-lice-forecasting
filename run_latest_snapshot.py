@@ -9,6 +9,5 @@ if str(SRC_DIR) not in sys.path:
 
 from lice.latest_snapshot import main
 
-
 if __name__ == "__main__":
     main()

@@ -21,6 +21,10 @@ from .features import add_baseline_features, build_master_table, create_targets
 from .map_data import write_site_map_geojson
 from .model import build_feature_matrix
 
+COMPLETENESS_LOOKBACK_WEEKS = 8
+COMPLETENESS_MIN_PRIOR_WEEKS = 4
+COMPLETENESS_SHARE_FLOOR = 0.8
+
 
 def main() -> None:
     ensure_output_dirs()
@@ -35,8 +39,12 @@ def main() -> None:
     master.to_parquet(LATEST_MASTER_TABLE_PATH, index=False)
 
     latest_rows, latest_dataset_date = build_latest_snapshot_rows(master)
+    scoring_rows, forecast_anchor_date, anchor_summary = build_latest_scoring_rows(
+        master
+    )
     model_specs = load_model_specs()
-    predictions = score_latest_site_rows(latest_rows, feature_columns, model_specs)
+    scoreable_rows = select_scoreable_snapshot_rows(scoring_rows)
+    predictions = score_latest_site_rows(scoreable_rows, feature_columns, model_specs)
     predictions.to_csv(LATEST_PREDICTIONS_PATH, index=False)
 
     site_map = write_site_map_geojson(
@@ -52,8 +60,16 @@ def main() -> None:
     print("Saved latest site snapshot to", LATEST_SITE_SNAPSHOT_PATH)
     print("Saved latest map data to", LATEST_SITE_MAP_PATH)
     if pd.notna(latest_dataset_date):
-        print("Latest dataset week:", latest_dataset_date.date().isoformat())
-    print("Scored site rows:", len(latest_rows))
+        print("Latest raw dataset week:", latest_dataset_date.date().isoformat())
+    if pd.notna(forecast_anchor_date):
+        print("Forecast anchor week:", forecast_anchor_date.date().isoformat())
+        print(
+            "Forecast anchor coverage:",
+            f"{int(anchor_summary['counted'])}/{int(anchor_summary['active'])} active sites",
+            f"({float(anchor_summary['counted_active_share']):.1%})",
+        )
+    print("Snapshot rows:", len(latest_rows))
+    print("Scored site rows:", len(scoreable_rows))
 
     top_columns = [
         column
@@ -81,13 +97,74 @@ def build_latest_snapshot_rows(
     if dated.empty:
         raise ValueError("No dated rows are available for latest snapshot scoring.")
 
-    latest_dataset_date = pd.to_datetime(dated["week_start_date"], errors="coerce").max()
+    latest_dataset_date = pd.to_datetime(
+        dated["week_start_date"], errors="coerce"
+    ).max()
     snapshot_rows = dated[dated["week_start_date"].eq(latest_dataset_date)].copy()
     if snapshot_rows.empty:
         raise ValueError("The latest reporting week has no rows available for scoring.")
 
-    snapshot_rows = snapshot_rows.sort_values(["sitenumber", "week_start_date"]).reset_index(drop=True)
+    snapshot_rows = snapshot_rows.sort_values(
+        ["sitenumber", "week_start_date"]
+    ).reset_index(drop=True)
     return snapshot_rows, latest_dataset_date
+
+
+def build_latest_scoring_rows(
+    master: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.Timestamp, pd.Series]:
+    dated = master[master["week_start_date"].notna()].copy()
+    if dated.empty:
+        raise ValueError("No dated rows are available for latest forecast scoring.")
+
+    weekly = (
+        dated.groupby("week_start_date", as_index=False)
+        .agg(
+            year=("year", "max"),
+            week=("week", "max"),
+            counted=("havecountedlice", lambda values: int(values.fillna(False).sum())),
+            active=("likelynofish", lambda values: int((~values.fillna(False)).sum())),
+        )
+        .sort_values("week_start_date")
+        .reset_index(drop=True)
+    )
+    if weekly.empty:
+        raise ValueError("No weekly rows are available for latest forecast scoring.")
+
+    active_denominator = weekly["active"].where(weekly["active"].ne(0))
+    weekly["counted_active_share"] = weekly["counted"] / active_denominator
+    weekly["prior_share_median"] = (
+        weekly["counted_active_share"]
+        .shift(1)
+        .rolling(
+            COMPLETENESS_LOOKBACK_WEEKS,
+            min_periods=COMPLETENESS_MIN_PRIOR_WEEKS,
+        )
+        .median()
+    )
+    weekly["complete_enough"] = weekly["counted_active_share"] >= (
+        weekly["prior_share_median"] * COMPLETENESS_SHARE_FLOOR
+    )
+
+    reliable_weeks = weekly[weekly["complete_enough"].fillna(False)].copy()
+    if reliable_weeks.empty:
+        fallback_weeks = weekly[weekly["counted"].gt(0)].copy()
+        if fallback_weeks.empty:
+            raise ValueError(
+                "No counted rows are available for latest forecast scoring."
+            )
+        reliable_weeks = fallback_weeks.tail(1).copy()
+
+    anchor_summary = reliable_weeks.tail(1).iloc[0]
+    forecast_anchor_date = pd.to_datetime(anchor_summary["week_start_date"])
+    scoring_rows = dated[dated["week_start_date"].eq(forecast_anchor_date)].copy()
+    if scoring_rows.empty:
+        raise ValueError("The forecast anchor week has no rows available for scoring.")
+
+    scoring_rows = scoring_rows.sort_values(
+        ["sitenumber", "week_start_date"]
+    ).reset_index(drop=True)
+    return scoring_rows, forecast_anchor_date, anchor_summary
 
 
 def load_model_specs() -> dict[tuple[int, str], dict[str, object]]:
@@ -124,11 +201,40 @@ def load_pickle(path: Path) -> object:
         return pickle.load(handle)
 
 
+def select_scoreable_snapshot_rows(latest_rows: pd.DataFrame) -> pd.DataFrame:
+    eligible_mask = (
+        latest_rows["havecountedlice"].fillna(False)
+        & ~latest_rows["likelynofish"].fillna(False)
+        & latest_rows["week_start_date"].notna()
+        & latest_rows["femaleadult"].notna()
+        & latest_rows["licelimitweek"].notna()
+    )
+    return latest_rows[eligible_mask].copy().reset_index(drop=True)
+
+
 def score_latest_site_rows(
     latest_rows: pd.DataFrame,
     feature_columns: list[str],
     model_specs: dict[tuple[int, str], dict[str, object]],
 ) -> pd.DataFrame:
+    if latest_rows.empty:
+        return pd.DataFrame(
+            columns=[
+                "sitenumber",
+                "sitename",
+                "productionareaid",
+                "productionarea",
+                "week_start_date",
+                "actual",
+                "prediction",
+                "score",
+                "candidate_model",
+                "decision_threshold",
+                "horizon",
+                "model_type",
+            ]
+        )
+
     feature_matrix = build_feature_matrix(latest_rows, feature_columns)
     classifier_scores_by_horizon: dict[int, np.ndarray] = {}
     regressor_predictions_by_horizon: dict[int, np.ndarray] = {}

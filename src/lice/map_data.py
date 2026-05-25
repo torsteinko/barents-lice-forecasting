@@ -69,17 +69,9 @@ def build_site_map_frame(
     predictions["week_start_date"] = pd.to_datetime(
         predictions["week_start_date"], errors="coerce"
     )
-    case_cutoff_date = _derive_case_cutoff_date(predictions)
-    if case_cutoff_date is not None:
-        master = master[master["week_start_date"] <= case_cutoff_date].copy()
-        vtreatment = vtreatment[
-            vtreatment["week_start_date"] <= case_cutoff_date
-        ].copy()
-        predictions = predictions[
-            predictions["week_start_date"] <= case_cutoff_date
-        ].copy()
-
     latest_status = _build_latest_status(master)
+    latest_raw_date = _derive_latest_raw_date(latest_status)
+    case_cutoff_date = _derive_case_cutoff_date(predictions)
     latest_treatment = _build_latest_treatment(vtreatment)
     prediction_snapshot = _build_prediction_snapshot(predictions)
 
@@ -95,6 +87,8 @@ def build_site_map_frame(
         how="left",
         validate="one_to_one",
     )
+    frame = _annotate_last_counted_week(frame)
+    frame = _suppress_currently_inactive_forecasts(frame)
 
     classifier_score_columns = [
         column
@@ -106,6 +100,9 @@ def build_site_map_frame(
         if column in frame.columns
     ]
     if classifier_score_columns:
+        frame["forecast_available"] = (
+            frame[classifier_score_columns].notna().any(axis=1)
+        )
         score_frame = frame[classifier_score_columns]
         frame["max_breach_risk"] = score_frame.max(axis=1, skipna=True)
         best_score_column = score_frame.fillna(-np.inf).idxmax(axis=1)
@@ -115,6 +112,7 @@ def build_site_map_frame(
         )
         frame.loc[score_frame.isna().all(axis=1), "priority_horizon"] = None
     else:
+        frame["forecast_available"] = False
         frame["max_breach_risk"] = np.nan
         frame["priority_horizon"] = None
 
@@ -160,9 +158,18 @@ def build_site_map_frame(
         ["max_breach_risk", "femaleadult_to_limit_ratio", "femaleadult"],
         ascending=[False, False, False],
     ).reset_index(drop=True)
+    if latest_raw_date is not None:
+        frame.attrs["latest_raw_date"] = latest_raw_date.date().isoformat()
+        frame.attrs["latest_raw_week_label"] = _format_timestamp_week_label(
+            latest_raw_date
+        )
     if case_cutoff_date is not None:
         frame.attrs["case_cutoff_date"] = case_cutoff_date.date().isoformat()
         frame.attrs["case_cutoff_week_label"] = _format_timestamp_week_label(
+            case_cutoff_date
+        )
+        frame.attrs["forecast_anchor_date"] = case_cutoff_date.date().isoformat()
+        frame.attrs["forecast_anchor_week_label"] = _format_timestamp_week_label(
             case_cutoff_date
         )
     return frame
@@ -173,6 +180,8 @@ def build_site_map_geojson(site_map: pd.DataFrame) -> dict[str, object]:
     property_columns = [
         column for column in site_map.columns if column not in {"latitude", "longitude"}
     ]
+    latest_raw_date = site_map.attrs.get("latest_raw_date")
+    latest_raw_week_label = site_map.attrs.get("latest_raw_week_label")
     case_cutoff_date = site_map.attrs.get("case_cutoff_date")
     case_cutoff_week_label = site_map.attrs.get("case_cutoff_week_label")
 
@@ -200,12 +209,26 @@ def build_site_map_geojson(site_map: pd.DataFrame) -> dict[str, object]:
         "type": "FeatureCollection",
         "metadata": {
             "feature_count": len(features),
-            "description": "Site snapshot aligned to the model-backed snapshot date, with treatment context and prediction outputs written against the same reporting window.",
+            "description": "Site status comes from the latest raw reporting week, while forecast outputs stay anchored to the latest reliable scoring week.",
+            "latest_raw_date": latest_raw_date,
+            "latest_raw_week_label": latest_raw_week_label,
             "case_cutoff_date": case_cutoff_date,
             "case_cutoff_week_label": case_cutoff_week_label,
+            "forecast_anchor_date": case_cutoff_date,
+            "forecast_anchor_week_label": case_cutoff_week_label,
         },
         "features": features,
     }
+
+
+def _derive_latest_raw_date(master: pd.DataFrame) -> pd.Timestamp | None:
+    if master.empty or "week_start_date" not in master.columns:
+        return None
+
+    dated = master[master["week_start_date"].notna()].copy()
+    if dated.empty:
+        return None
+    return pd.to_datetime(dated["week_start_date"].max())
 
 
 def _derive_case_cutoff_date(predictions: pd.DataFrame) -> pd.Timestamp | None:
@@ -226,6 +249,38 @@ def _derive_case_cutoff_date(predictions: pd.DataFrame) -> pd.Timestamp | None:
     if latest_per_group.empty:
         return dated["week_start_date"].max()
     return pd.to_datetime(latest_per_group.min())
+
+
+def _annotate_last_counted_week(frame: pd.DataFrame) -> pd.DataFrame:
+    frame = frame.copy()
+    frame["last_counted_date"] = pd.NaT
+    has_last_count = (
+        frame["week_start_date"].notna() & frame["weeks_since_last_counted"].notna()
+    )
+    frame.loc[has_last_count, "last_counted_date"] = pd.to_datetime(
+        frame.loc[has_last_count, "week_start_date"]
+    ) - pd.to_timedelta(frame.loc[has_last_count, "weeks_since_last_counted"], unit="W")
+    frame["last_counted_week_label"] = frame["last_counted_date"].apply(
+        _format_timestamp_week_label
+    )
+    return frame
+
+
+def _suppress_currently_inactive_forecasts(frame: pd.DataFrame) -> pd.DataFrame:
+    frame = frame.copy()
+    prediction_value_columns = [
+        column
+        for column in frame.columns
+        if (column.startswith("classifier_") and column.endswith("_score"))
+        or (column.startswith("count_") and column.endswith("_prediction"))
+    ]
+    if not prediction_value_columns:
+        return frame
+
+    currently_inactive = frame["likelynofish"].fillna(False)
+    if currently_inactive.any():
+        frame.loc[currently_inactive, prediction_value_columns] = np.nan
+    return frame
 
 
 def _build_latest_status(master: pd.DataFrame) -> pd.DataFrame:

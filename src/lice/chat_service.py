@@ -245,7 +245,9 @@ class SiteChatService:
                 visible_site_ids=visible_site_ids,
             )
 
-        master_table_path = self._active_master_table_path or self._resolve_data_paths()[1]
+        master_table_path = (
+            self._active_master_table_path or self._resolve_data_paths()[1]
+        )
         if not master_table_path.exists():
             self._last_llm_error = f"Missing chat dataset at {master_table_path}"
             return self._build_failure_response(
@@ -266,13 +268,8 @@ class SiteChatService:
         engine = None
         try:
             engine = self._create_duckdb_engine()
-            database = self._create_sql_database(engine, visible_site_ids)
-            raw_output = self._run_sql_agent(
-                message_text,
-                database,
-                selected_site_id=selected_site_id,
-                visible_site_ids=visible_site_ids,
-            )
+            database = self._create_sql_database(engine)
+            raw_output = self._run_sql_agent(message_text, database)
             parsed = self._parse_agent_result(message_text, raw_output)
         except Exception as exc:
             self._last_llm_error = _truncate_error(exc)
@@ -290,16 +287,17 @@ class SiteChatService:
             "used_llm": True,
             "metric_key": DEFAULT_SITE_CARD_METRIC,
             "metric_label": "current snapshot context",
-            "filters_applied": self._build_scope_notes(
-                selected_site_id, visible_site_ids
-            ),
-            "proxy_note": self._build_scope_note(visible_site_ids),
+            "filters_applied": [],
+            "proxy_note": None,
             "sites": self._hydrate_sites(parsed.sitenumbers),
             "llm": self.get_llm_status(),
         }
 
     def _resolve_data_paths(self) -> tuple[Path, Path]:
-        if self._requested_geojson_path is not None or self._requested_master_table_path is not None:
+        if (
+            self._requested_geojson_path is not None
+            or self._requested_master_table_path is not None
+        ):
             geojson_path = self._requested_geojson_path or self.default_geojson_path
             master_table_path = (
                 self._requested_master_table_path or self.default_master_table_path
@@ -319,9 +317,7 @@ class SiteChatService:
 
         current_mtime = geojson_path.stat().st_mtime
         parquet_mtime = (
-            master_table_path.stat().st_mtime
-            if master_table_path.exists()
-            else None
+            master_table_path.stat().st_mtime if master_table_path.exists() else None
         )
         if (
             self._cached_geojson is not None
@@ -448,17 +444,18 @@ class SiteChatService:
     def _create_sql_database(
         self,
         engine: Any,
-        visible_site_ids: Sequence[str] | None,
     ) -> Any:
-        master_table_path = self._active_master_table_path or self._resolve_data_paths()[1]
+        master_table_path = (
+            self._active_master_table_path or self._resolve_data_paths()[1]
+        )
         parquet_path = master_table_path.resolve().as_posix()
         with engine.begin() as connection:
             connection.exec_driver_sql(self._build_master_view_sql(parquet_path))
-            connection.exec_driver_sql(self._build_visible_view_sql(visible_site_ids))
+            connection.exec_driver_sql(self._build_visible_view_sql())
 
         return SQLDatabase(
             engine=engine,
-            include_tables=["master_table", "visible_master_table"],
+            include_tables=["master_table"],
             view_support=True,
             sample_rows_in_table_info=2,
             max_string_length=500,
@@ -482,36 +479,16 @@ class SiteChatService:
             return " WHERE CAST(year AS INTEGER) <= 2025"
         return ""
 
-    def _build_visible_view_sql(self, visible_site_ids: Sequence[str] | None) -> str:
-        if visible_site_ids is None:
-            return (
-                "CREATE OR REPLACE VIEW visible_master_table AS "
-                "SELECT * FROM master_table"
-            )
-
-        normalized_ids = _normalize_site_ids(visible_site_ids)
-        if not normalized_ids:
-            return (
-                "CREATE OR REPLACE VIEW visible_master_table AS "
-                "SELECT * FROM master_table WHERE 1 = 0"
-            )
-
-        quoted_ids = ", ".join(
-            _quote_sql_literal(site_id) for site_id in normalized_ids
-        )
+    def _build_visible_view_sql(self) -> str:
         return (
             "CREATE OR REPLACE VIEW visible_master_table AS "
-            "SELECT * FROM master_table "
-            f"WHERE CAST(sitenumber AS VARCHAR) IN ({quoted_ids})"
+            "SELECT * FROM master_table"
         )
 
     def _run_sql_agent(
         self,
         message: str,
         database: Any,
-        *,
-        selected_site_id: str | None,
-        visible_site_ids: Sequence[str] | None,
     ) -> str:
         llm = self._get_llm()
         toolkit = ReadOnlySQLDatabaseToolkit(db=database, llm=llm)
@@ -519,37 +496,25 @@ class SiteChatService:
             llm=llm,
             toolkit=toolkit,
             agent_type="tool-calling",
-            prefix=self._build_agent_prefix(selected_site_id, visible_site_ids),
+            prefix=self._build_agent_prefix(),
             suffix=self._build_agent_suffix(),
             top_k=DEFAULT_SQL_TOP_K,
             max_iterations=10,
             verbose=False,
             agent_executor_kwargs={"handle_parsing_errors": True},
         )
-        result = agent_executor.invoke(
-            {
-                "input": self._build_agent_input(
-                    message, selected_site_id, visible_site_ids
-                )
-            }
-        )
+        result = agent_executor.invoke({"input": self._build_agent_input(message)})
         output = result.get("output") if isinstance(result, dict) else None
         if not isinstance(output, str) or not output.strip():
             raise RuntimeError("SQL agent returned no answer text")
         return output.strip()
 
-    def _build_agent_prefix(
-        self,
-        selected_site_id: str | None,
-        visible_site_ids: Sequence[str] | None,
-    ) -> str:
-        scope_description = self._describe_visible_scope(visible_site_ids)
+    def _build_agent_prefix(self) -> str:
         cutoff_text = (
             self._case_cutoff_date.date().isoformat()
             if self._case_cutoff_date is not None
             else "the validated pre-2026 case window"
         )
-        selected_site_text = selected_site_id or "none"
         return (
             "You are an expert aquaculture analyst for Mowi. "
             "You are designed to interact with a SQL database that contains aquaculture observations and forecasts. "
@@ -562,9 +527,7 @@ class SiteChatService:
             "You MUST use the SQL checker tool before executing a query. If a query returns an error, rewrite it and try again.\n\n"
             "Security and scope rules:\n"
             "- The database is read-only. Never attempt INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, COPY, EXPORT, ATTACH, DETACH, INSTALL, LOAD, SET, PRAGMA, or any other write or admin statement.\n"
-            f"- The default request scope is: {scope_description}.\n"
-            "- Use visible_master_table by default for map-scoped questions. Use master_table only when the user explicitly asks for all sites, nationwide analysis, or broader history than the current map scope.\n"
-            f"- Selected site on the map: {selected_site_text}.\n"
+            "- Use the master_table view for all analysis. It already contains the full latest scored dataset across all sites.\n"
             f"- Case cutoff: {cutoff_text}. Treat any data after that cutoff as out of scope.\n\n"
             "When you are done, your final answer MUST be a valid JSON object with this exact shape: "
             '{{"answer":"...","sitenumbers":["12345","67890"]}}.\n'
@@ -580,19 +543,8 @@ class SiteChatService:
             "double-check any query before execution, and then return only the final JSON object."
         )
 
-    def _build_agent_input(
-        self,
-        message: str,
-        selected_site_id: str | None,
-        visible_site_ids: Sequence[str] | None,
-    ) -> str:
+    def _build_agent_input(self, message: str) -> str:
         parts = [f"User question: {message}"]
-        if selected_site_id:
-            parts.append(f"Selected site on map: {selected_site_id}")
-        if visible_site_ids is not None:
-            parts.append(
-                f"Visible map site count: {len(_normalize_site_ids(visible_site_ids))}"
-            )
         parts.append(
             "Return only the final JSON object when you have enough information."
         )
@@ -719,10 +671,8 @@ class SiteChatService:
             "used_llm": False,
             "metric_key": DEFAULT_SITE_CARD_METRIC,
             "metric_label": "current snapshot context",
-            "filters_applied": self._build_scope_notes(
-                selected_site_id, visible_site_ids
-            ),
-            "proxy_note": self._build_scope_note(visible_site_ids),
+            "filters_applied": [],
+            "proxy_note": None,
             "sites": [],
             "llm": self.get_llm_status(),
         }

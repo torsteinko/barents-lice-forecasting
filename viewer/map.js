@@ -61,6 +61,10 @@ const KPI_HELP = {
     "Reported persistent lice level for the latest reporting week. A dash means it was not reported that week.",
   counted_lice_this_week:
     "Whether the site submitted a lice count in the latest reporting week.",
+  last_counted_week:
+    "Most recent reporting week in which this site submitted a lice count.",
+  weeks_since_last_count:
+    "How many reporting weeks have passed since this site last submitted a lice count.",
   likely_no_fish:
     "BarentsWatch flag indicating the site likely had no fish present in the latest reporting week.",
   last_treatment_week:
@@ -219,7 +223,7 @@ function renderKpiHelp(helpText) {
     return "";
   }
   const safeHelpText = escapeHtml(helpText);
-  return `<span class="detail-kpi-help" tabindex="0" aria-label="${safeHelpText}" data-tooltip="${safeHelpText}">?</span>`;
+  return `<button type="button" class="detail-kpi-help" aria-label="${safeHelpText}" title="${safeHelpText}">?</button>`;
 }
 
 function normalizeNameKey(value) {
@@ -317,7 +321,7 @@ function riskBucket(value, metricKey = state.currentMetric) {
   const metric = METRICS[metricKey];
   const numeric = toNumber(value);
   if (numeric === null) {
-    return "stable";
+    return "unavailable";
   }
   if (numeric >= metric.thresholds[2]) {
     return "critical";
@@ -350,6 +354,9 @@ function bucketColor(bucket) {
   }
   if (bucket === "watch") {
     return "#1f867d";
+  }
+  if (bucket === "unavailable") {
+    return "#94a0a6";
   }
   return "#74828a";
 }
@@ -397,11 +404,24 @@ async function fetchSiteDataset() {
 }
 
 function renderCaseDate() {
-  const caseWeek = state.datasetMeta?.case_cutoff_week_label || null;
-  document.getElementById("case-date-value").textContent = formatWeekLabel(caseWeek);
-  document.getElementById("case-date-note").textContent = caseWeek
-    ? `Everything shown here is aligned to the latest scored reporting week ${formatWeekLabel(caseWeek)}.`
-    : "All site status, treatment context, and answers are aligned to the latest scored snapshot.";
+  const rawWeek = state.datasetMeta?.latest_raw_week_label || null;
+  const forecastWeek =
+    state.datasetMeta?.forecast_anchor_week_label ||
+    state.datasetMeta?.case_cutoff_week_label ||
+    null;
+
+  document.getElementById("case-date-value").textContent = formatWeekLabel(rawWeek || forecastWeek);
+  if (rawWeek && forecastWeek && rawWeek !== forecastWeek) {
+    document.getElementById("case-date-note").textContent = `Viewer status uses raw week ${formatWeekLabel(rawWeek)}. Forecasts stay anchored to verified week ${formatWeekLabel(forecastWeek)} until the newer raw weeks are complete.`;
+    return;
+  }
+  if (rawWeek) {
+    document.getElementById("case-date-note").textContent = `Viewer status and forecasts are both aligned to ${formatWeekLabel(rawWeek)}.`;
+    return;
+  }
+  document.getElementById("case-date-note").textContent = forecastWeek
+    ? `Forecasts are anchored to ${formatWeekLabel(forecastWeek)}.`
+    : "Viewer status and forecasts will appear here once site data is loaded.";
 }
 
 function renderMetricSwitcher() {
@@ -461,6 +481,7 @@ function populateFilters() {
 function buildLegend() {
   const metric = METRICS[state.currentMetric];
   const bands = [
+    { label: "No current verified value", bucket: "unavailable" },
     { label: `Below ${formatLegendValue(metric.thresholds[0], metric.kind)}`, bucket: "stable" },
     { label: `${formatLegendValue(metric.thresholds[0], metric.kind)} to ${formatLegendValue(metric.thresholds[1], metric.kind)}`, bucket: "watch" },
     { label: `${formatLegendValue(metric.thresholds[1], metric.kind)} to ${formatLegendValue(metric.thresholds[2], metric.kind)}`, bucket: "high" },
@@ -629,10 +650,85 @@ function detailKpi(label, value, helpText = "") {
   `;
 }
 
+function hasForecast(site) {
+  return [1, 2, 12].some((horizon) => toNumber(site[`classifier_${horizon}w_score`]) !== null);
+}
+
+function buildForecastNotice(site) {
+  const rawWeek = state.datasetMeta?.latest_raw_week_label || site.latest_reporting_week_label || null;
+  const forecastWeek =
+    state.datasetMeta?.forecast_anchor_week_label ||
+    state.datasetMeta?.case_cutoff_week_label ||
+    null;
+  const lastCountedWeek = site.last_counted_week_label || null;
+  const forecastAvailable = Boolean(site.forecast_available) && hasForecast(site);
+
+  if (site.likelynofish) {
+    return {
+      tone: "muted",
+      title: "Forecast hidden for inactive site",
+      body: rawWeek
+        ? `The latest raw feed marks this site as likely no fish in ${formatWeekLabel(rawWeek)}. Forecast cards are hidden until the site is active again.`
+        : "The latest raw feed marks this site as likely no fish. Forecast cards are hidden until the site is active again.",
+    };
+  }
+
+  if (!forecastAvailable) {
+    return {
+      tone: "warn",
+      title: "No verified forecast available",
+      body: forecastWeek
+        ? `This site does not have a usable counted-lice row in the forecast anchor week ${formatWeekLabel(forecastWeek)}, so no model forecast is shown.`
+        : "This site does not have a usable verified row for forecasting, so no model forecast is shown.",
+    };
+  }
+
+  if (!rawWeek || !forecastWeek || rawWeek === forecastWeek) {
+    return null;
+  }
+
+  if (site.havecountedlice) {
+    return {
+      tone: "info",
+      title: "Forecast held at verified week",
+      body: `This site already has raw status in ${formatWeekLabel(rawWeek)}, but the forecast stays anchored to verified week ${formatWeekLabel(forecastWeek)} until the newer raw weeks are complete.`,
+    };
+  }
+
+  if (lastCountedWeek && lastCountedWeek !== forecastWeek) {
+    return {
+      tone: "warn",
+      title: "Site has not reported in the latest raw week",
+      body: `This site has not reported for ${formatWeekLabel(rawWeek)} yet. Its most recent lice count is ${formatWeekLabel(lastCountedWeek)}, and the forecast remains anchored to verified week ${formatWeekLabel(forecastWeek)}.`,
+    };
+  }
+
+  return {
+    tone: "warn",
+    title: "Site has not reported in the latest raw week",
+    body: `This site has not reported for ${formatWeekLabel(rawWeek)} yet. The forecast you are seeing is based on verified week ${formatWeekLabel(forecastWeek)} data.`,
+  };
+}
+
+function renderForecastNotice(site) {
+  const notice = buildForecastNotice(site);
+  if (!notice) {
+    return "";
+  }
+  return `
+    <div class="detail-banner ${escapeHtml(notice.tone)}">
+      <strong>${escapeHtml(notice.title)}</strong>
+      <p>${escapeHtml(notice.body)}</p>
+    </div>
+  `;
+}
+
 function forecastCard(site, horizon) {
   const score = site[`classifier_${horizon}w_score`];
   const count = site[`count_${horizon}w_prediction`];
-  const risk = riskBucket(score, `classifier_${horizon}w_score`);
+  const scoreValue = toNumber(score);
+  const countValue = toNumber(count);
+  const risk = scoreValue === null ? "unavailable" : riskBucket(scoreValue, `classifier_${horizon}w_score`);
   const helpText = horizon === 1 ? KPI_HELP.forecast_1w : horizon === 2 ? KPI_HELP.forecast_2w : KPI_HELP.forecast_12w;
   return `
     <div class="detail-kpi">
@@ -640,9 +736,9 @@ function forecastCard(site, horizon) {
         <span>${horizon}w breach risk</span>
         ${renderKpiHelp(helpText)}
       </div>
-      <strong>${escapeHtml(formatPercent(score))}</strong>
+      <strong>${escapeHtml(formatPercent(scoreValue))}</strong>
       <span class="mini-pill ${risk}">${escapeHtml(formatStatusLabel(risk))}</span>
-      <span>Predicted count ${escapeHtml(formatNumber(count))}</span>
+      <span>${escapeHtml(scoreValue === null ? "No verified forecast available" : `Predicted count ${formatNumber(countValue)}`)}</span>
     </div>
   `;
 }
@@ -676,6 +772,8 @@ function renderDetailPanel(site) {
         </div>
         <div class="detail-actions">
           <span class="badge">${escapeHtml(METRICS[state.currentMetric].label)}: ${escapeHtml(formatMetric(site))}</span>
+          <span class="badge">Raw status ${escapeHtml(formatWeekLabel(state.datasetMeta?.latest_raw_week_label || site.latest_reporting_week_label))}</span>
+          <span class="badge">Forecast anchor ${escapeHtml(formatWeekLabel(state.datasetMeta?.forecast_anchor_week_label || state.datasetMeta?.case_cutoff_week_label))}</span>
           <span class="badge">Coords ${escapeHtml(formatNumber(site.latitude, 4))}, ${escapeHtml(formatNumber(site.longitude, 4))}</span>
         </div>
         <div class="detail-kpis">
@@ -688,6 +786,7 @@ function renderDetailPanel(site) {
       ${detailSection(
         "Forecast horizon cards",
         `
+          ${renderForecastNotice(site)}
           <div class="forecast-grid">
             ${forecastCard(site, 1)}
             ${forecastCard(site, 2)}
@@ -702,10 +801,12 @@ function renderDetailPanel(site) {
         `
           <div class="detail-grid">
             ${detailKpi("Latest reporting week", formatWeekLabel(site.latest_reporting_week_label), KPI_HELP.latest_reporting_week)}
+            ${detailKpi("Last counted week", formatWeekLabel(site.last_counted_week_label), KPI_HELP.last_counted_week)}
             ${detailKpi("Sea temperature", formatNumber(site.seatemperature), KPI_HELP.sea_temperature)}
             ${detailKpi("Mobile lice", formatNumber(site.mobilelice), KPI_HELP.mobile_lice)}
             ${detailKpi("Persistent lice", formatNumber(site.persistentlice), KPI_HELP.persistent_lice)}
             ${detailKpi("Counted lice this week", formatBoolean(site.havecountedlice), KPI_HELP.counted_lice_this_week)}
+            ${detailKpi("Weeks since last count", formatNumber(site.weeks_since_last_counted, 0), KPI_HELP.weeks_since_last_count)}
             ${detailKpi("Likely no fish", formatBoolean(site.likelynofish), KPI_HELP.likely_no_fish)}
           </div>
         `,
@@ -978,11 +1079,7 @@ async function submitChat(message) {
     const response = await fetch(buildApiUrl("/chat"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        message,
-        selected_site_id: state.selectedId,
-        visible_site_ids: state.visible.map((site) => site.id),
-      }),
+      body: JSON.stringify({ message }),
     });
     if (!response.ok) {
       throw new Error(`Chat request failed with ${response.status}`);
