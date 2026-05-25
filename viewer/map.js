@@ -310,7 +310,8 @@ function escapeHtml(value) {
 function renderMarkdown(text) {
   const safeText = formatText(text);
   if (window.marked && window.DOMPurify) {
-    const rawHtml = window.marked.parse(safeText, {
+    const markdownText = safeText.replace(/~/g, "&#126;");
+    const rawHtml = window.marked.parse(markdownText, {
       breaks: true,
       gfm: true,
     });
