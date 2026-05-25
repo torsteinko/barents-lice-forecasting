@@ -31,10 +31,18 @@ const METRICS = {
   },
 };
 
+const METRIC_SWITCHER_ORDER = [
+  "femaleadult_to_limit_ratio",
+  "classifier_1w_score",
+  "classifier_2w_score",
+  "classifier_12w_score",
+];
+const DEFAULT_METRIC = "femaleadult_to_limit_ratio";
+
 const RISK_FILTERS = ["critical", "high", "watch", "stable", "unavailable"];
 const CHAT_SUGGESTIONS = [
   "Which site in Vestland has the biggest chance of outbreak the next 2 weeks?",
-  "Which sites are already above the lice limit right now?",
+  "Which sites are closest to breaching the lice limit right now?",
   "Show me the highest 12-week risk sites that were treated recently.",
 ];
 
@@ -123,7 +131,7 @@ const state = {
   visible: [],
   selectedId: null,
   datasetMeta: {},
-  currentMetric: "near_term_risk",
+  currentMetric: DEFAULT_METRIC,
   riskFilters: new Set(RISK_FILTERS),
   area: "all",
   county: "all",
@@ -419,25 +427,25 @@ function renderCaseDate() {
 
   document.getElementById("case-date-value").textContent = formatWeekLabel(rawWeek || forecastWeek);
   if (rawWeek && forecastWeek && rawWeek !== forecastWeek) {
-    document.getElementById("case-date-note").textContent = `Viewer status uses raw week ${formatWeekLabel(rawWeek)}. Forecasts stay anchored to verified week ${formatWeekLabel(forecastWeek)} until the newer raw weeks are complete.`;
+    document.getElementById("case-date-note").textContent = `Current status ${formatWeekLabel(rawWeek)}; forecast anchor ${formatWeekLabel(forecastWeek)}.`;
     return;
   }
   if (rawWeek) {
-    document.getElementById("case-date-note").textContent = `Viewer status and forecasts are both aligned to ${formatWeekLabel(rawWeek)}.`;
+    document.getElementById("case-date-note").textContent = `Current status and forecasts align to ${formatWeekLabel(rawWeek)}.`;
     return;
   }
   document.getElementById("case-date-note").textContent = forecastWeek
-    ? `Forecasts are anchored to ${formatWeekLabel(forecastWeek)}.`
+    ? `Forecast anchor ${formatWeekLabel(forecastWeek)}.`
     : "Viewer status and forecasts will appear here once site data is loaded.";
 }
 
 function renderMetricSwitcher() {
   const container = document.getElementById("metric-switcher");
-  container.innerHTML = Object.entries(METRICS)
+  container.innerHTML = METRIC_SWITCHER_ORDER.filter((metricKey) => METRICS[metricKey])
     .map(
-      ([metricKey, metric]) => `
+      (metricKey) => `
         <button type="button" class="metric-chip ${metricKey === state.currentMetric ? "active" : ""}" data-metric="${metricKey}">
-          <span>${escapeHtml(metric.label)}</span>
+          <span>${escapeHtml(METRICS[metricKey].label)}</span>
         </button>
       `,
     )
@@ -616,7 +624,6 @@ function renderStats() {
     </article>
   `;
 
-  document.getElementById("visible-summary").textContent = `${visible.length} visible`;
   document.getElementById("queue-summary").textContent = visible.length
     ? `Sorted by ${METRICS[state.currentMetric].label}`
     : "No visible sites";
@@ -1010,7 +1017,9 @@ function appendChatMessage(role, html) {
 }
 
 function renderSuggestionChips() {
-  document.getElementById("chat-suggestions").innerHTML = CHAT_SUGGESTIONS.map(
+  const suggestionRow = document.getElementById("chat-suggestions");
+  suggestionRow.hidden = false;
+  suggestionRow.innerHTML = CHAT_SUGGESTIONS.map(
     (suggestion) => `<button type="button" class="suggestion-chip">${escapeHtml(suggestion)}</button>`,
   ).join("");
 
@@ -1020,6 +1029,12 @@ function renderSuggestionChips() {
       setChatOpen(true);
     });
   });
+}
+
+function hideSuggestionChips() {
+  const suggestionRow = document.getElementById("chat-suggestions");
+  suggestionRow.hidden = true;
+  suggestionRow.innerHTML = "";
 }
 
 function buildChatSiteMetricSummary(site, payload) {
@@ -1132,6 +1147,7 @@ async function submitChat(message) {
   const submitButton = document.getElementById("chat-submit-button");
   setChatOpen(true);
   submitButton.disabled = true;
+  hideSuggestionChips();
   appendChatMessage("user", `<div class="message-copy">${renderMarkdown(message)}</div>`);
   appendLoadingMessage();
 
@@ -1187,28 +1203,6 @@ function wireControls() {
 
   document.getElementById("counted-only-toggle").addEventListener("change", (event) => {
     state.countedOnly = event.target.checked;
-    refreshView({ fitBounds: true });
-  });
-
-  document.getElementById("fit-visible-button").addEventListener("click", () => {
-    fitVisibleSites();
-  });
-
-  document.getElementById("reset-filters-button").addEventListener("click", () => {
-    state.currentMetric = "near_term_risk";
-    state.riskFilters = new Set(RISK_FILTERS);
-    state.area = "all";
-    state.county = "all";
-    state.query = "";
-    state.overLimitOnly = false;
-    state.recentTreatmentOnly = false;
-    state.countedOnly = false;
-    document.getElementById("area-filter").value = "all";
-    document.getElementById("county-filter").value = "all";
-    document.getElementById("search-input").value = "";
-    document.getElementById("over-limit-toggle").checked = false;
-    document.getElementById("recent-treatment-toggle").checked = false;
-    document.getElementById("counted-only-toggle").checked = false;
     refreshView({ fitBounds: true });
   });
 

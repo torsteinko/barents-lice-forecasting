@@ -14,7 +14,7 @@
       href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/viewer/map.css?v=20260525f" />
+    <link rel="stylesheet" href="/viewer/map.css?v=20260525i" />
   </head>
   <body>
     <div class="app-shell">
@@ -24,37 +24,24 @@
         <div class="brand-block">
           <p class="eyebrow">Barents Lice Forecasting</p>
           <h1>Operations Atlas</h1>
-          <p class="subhead">
-            Full-screen site intelligence for forecast risk, treatment context,
-            and rapid operational triage.
-          </p>
-          <div class="case-date-block">
-            <span class="case-date-label">Latest raw week</span>
-            <strong class="case-date-value" id="case-date-value">--</strong>
-            <span class="case-date-note" id="case-date-note"
-              >Viewer status uses the newest raw week, while forecasts stay on the latest verified scoring week.</span
-            >
-          </div>
         </div>
 
         <section class="metric-strip">
           <div class="strip-label-row">
             <div>
               <p class="eyebrow">Map metric</p>
-              <h2 id="metric-title">Near-term breach risk</h2>
+              <h2 id="metric-title">Current limit ratio</h2>
             </div>
-            <span class="badge" id="visible-summary">0 visible</span>
           </div>
           <div class="metric-switcher" id="metric-switcher"></div>
         </section>
 
-        <div class="topbar-actions">
-          <button type="button" class="ghost-button" id="fit-visible-button">
-            Fit visible sites
-          </button>
-          <button type="button" class="ghost-button" id="reset-filters-button">
-            Reset filters
-          </button>
+        <div class="case-date-block">
+          <span class="case-date-label">Raw week</span>
+          <strong class="case-date-value" id="case-date-value">--</strong>
+          <span class="case-date-note" id="case-date-note"
+            >Current status uses the raw week; forecasts use the verified anchor.</span
+          >
         </div>
       </header>
 
@@ -184,6 +171,6 @@
     <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.6/dist/purify.min.js"></script>
-    <script src="/viewer/map.js?v=20260525g"></script>
+    <script src="/viewer/map.js?v=20260525i"></script>
   </body>
 </html>

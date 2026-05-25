@@ -45,6 +45,8 @@ The project expects the BarentsWatch source files at these paths:
 - `data/vlice.csv`
 - `data/vtreatment.csv`
 
+### **Due to the size they are not uploaded to the repository, so you will have to upload them yourself.**
+
 The challenge data is based on public BarentsWatch lice and treatment datasets. If you intend to publish this repository publicly with raw CSVs or generated derivative artifacts committed, verify the relevant redistribution terms before doing so.
 
 ## Modeling policy
