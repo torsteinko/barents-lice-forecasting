@@ -41,7 +41,7 @@ const DEFAULT_METRIC = "femaleadult_to_limit_ratio";
 
 const RISK_FILTERS = ["critical", "high", "watch", "stable", "unavailable"];
 const CHAT_SUGGESTIONS = [
-  "Which site in Vestland has the biggest chance of outbreak the next 2 weeks?",
+  "Which sites in Vestland has the biggest chance of outbreak the next 12 weeks?",
   "Which sites are closest to breaching the lice limit right now?",
   "Show me the highest 12-week risk sites that were treated recently.",
 ];
@@ -950,6 +950,7 @@ function setChatOpen(nextOpen) {
   const backdrop = document.getElementById("chat-backdrop");
   const openButton = document.getElementById("open-chat-button");
   const toggleButton = document.getElementById("toggle-chat-button");
+  const chatInput = document.getElementById("chat-input");
 
   drawer.classList.toggle("open", nextOpen);
   backdrop.classList.toggle("visible", nextOpen);
@@ -957,7 +958,13 @@ function setChatOpen(nextOpen) {
   toggleButton.textContent = nextOpen ? "Hide" : "Open panel";
 
   if (nextOpen) {
-    document.getElementById("chat-input").focus();
+    requestAnimationFrame(() => {
+      try {
+        chatInput.focus({ preventScroll: true });
+      } catch {
+        chatInput.focus();
+      }
+    });
   }
 }
 
