@@ -648,6 +648,15 @@ h2 {
   flex-wrap: wrap;
 }
 
+.chat-header {
+  flex-wrap: nowrap;
+}
+
+.chat-header .ghost-button.compact {
+  margin-left: auto;
+  align-self: flex-start;
+}
+
 .site-card-bottom,
 .detail-actions {
   margin-top: 10px;
