@@ -955,10 +955,16 @@ h2 {
 
 .chat-transcript {
   display: grid;
+  align-content: start;
+  grid-auto-rows: max-content;
   gap: 10px;
   min-height: 0;
   overflow-y: auto;
   padding-right: 2px;
+}
+
+.chat-message {
+  align-self: start;
 }
 
 .chat-message.user {

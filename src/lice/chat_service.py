@@ -300,8 +300,10 @@ class SiteChatService:
             if engine is not None:
                 engine.dispose()
 
+        answer_text = _simplify_answer_text(parsed.answer)
+
         return {
-            "answer": parsed.answer,
+            "answer": answer_text,
             "used_llm": True,
             "metric_key": metric_key,
             "metric_label": SITE_CARD_METRIC_LABELS.get(
@@ -536,7 +538,7 @@ class SiteChatService:
             prefix=self._build_agent_prefix(),
             suffix=self._build_agent_suffix(),
             top_k=DEFAULT_SQL_TOP_K,
-            max_iterations=10,
+            max_iterations=12,
             verbose=False,
             agent_executor_kwargs={"handle_parsing_errors": True},
         )
@@ -556,6 +558,11 @@ class SiteChatService:
             "You are an expert aquaculture analyst for Mowi. "
             "You are designed to interact with a SQL database that contains aquaculture observations and forecasts. "
             "Base every claim strictly on the database results you retrieve. If the data does not support a claim, say so rather than guessing.\n\n"
+            "Answer style rules:\n"
+            "- Write for an operational non-technical user. Prefer plain business language.\n"
+            "- Do not mention internal table names, SQL, column names, or implementation details unless the user explicitly asks for them.\n"
+            "- Do not say things like master_table, site_snapshot, femaleadult_to_limit_ratio, any_treatment, or treatment_count in the final answer. Translate them into natural language instead.\n"
+            "- Lead with the conclusion, then add only the minimum explanation needed.\n\n"
             "Given an input question, create a syntactically correct {dialect} query to run, then look at the results of the query and return the answer. "
             "Unless the user specifies a specific number of examples they wish to obtain, always limit your query to at most {top_k} rows. "
             "You can order the results by a relevant column to return the most useful examples. "
@@ -564,12 +571,15 @@ class SiteChatService:
             "You MUST use the SQL checker tool before executing a query. If a query returns an error, rewrite it and try again.\n\n"
             "Security and scope rules:\n"
             "- The database is read-only. Never attempt INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, COPY, EXPORT, ATTACH, DETACH, INSTALL, LOAD, SET, PRAGMA, or any other write or admin statement.\n"
-            "- Use site_snapshot for questions about right now, current status, the latest raw reporting week, current ratios, current counts, or current forecast cards. site_snapshot has one row per site.\n"
-            "- Use master_table for historical site-week analysis, trends, or week-by-week reasoning across time.\n"
+            "- Use site_snapshot only for snapshot lookup questions about right now, current status, the latest raw reporting week, current ratios, current counts, or current forecast cards. site_snapshot has one row per site.\n"
+            "- Use master_table for historical site-week analysis, trends, changes over time, pre-breach analysis, treatment intensity, repeated breaches, and week-by-week reasoning across time.\n"
             f"- master_table is capped at the forecast anchor date {cutoff_text}. Treat any later week-level history as out of scope in master_table.\n"
             "- site_snapshot can be newer than master_table because it reflects the latest raw operational week plus the current forecast snapshot.\n\n"
             "- No visible-only site subset is provided to chat in this build. If the user says visible sites, interpret that as the full current site_snapshot and answer from the available data instead of claiming the search was interrupted.\n"
             "- For questions about sites already above the lice limit right now, use currently_over_limit from site_snapshot. If no rows match, answer that there are currently no sites identified as above the lice limit in the latest site snapshot.\n\n"
+            "- If the user asks which areas currently show increasing lice pressure, that is a historical trend question. Use master_table and compare the last 3 observed weeks against the preceding 3 observed weeks by production area among counted rows. Define pressure using the average adult-female-lice-to-limit ratio, rank areas by the size of the positive change, and list only areas with a positive change. Do not substitute forecast risk from site_snapshot.\n"
+            "- If the user asks what patterns are visible before breaches occur, use master_table and compare breach site-weeks to the preceding observed week or weeks for the same sites.\n"
+            "- If the user asks which production areas have the highest treatment intensity, use master_table and rank production areas by a normalized historical treatment rate rather than raw totals. Use plain language in the answer.\n\n"
             "When you are done, your final answer MUST be a valid JSON object with this exact shape: "
             '{{"answer":"...","sitenumbers":["12345","67890"]}}.\n'
             "- The answer field must contain the user-facing answer text.\n"
@@ -595,6 +605,12 @@ class SiteChatService:
             parts.append(f"Forecast anchor week: {self._forecast_anchor_week_label}.")
         parts.append(
             "Use site_snapshot for current/latest/right-now questions. Use master_table for historical weekly questions."
+        )
+        parts.append(
+            "Questions about increasing pressure, treatment intensity, repeated breaches, or patterns before breaches should use master_table even if they mention current conditions."
+        )
+        parts.append(
+            "Use plain language in the final answer and avoid internal table or column names."
         )
         parts.append(
             "Return only the final JSON object when you have enough information."
@@ -980,6 +996,18 @@ def _augment_chat_question(message: str) -> str:
         notes.append(
             "Clarification: for right-now lice-limit questions, use currently_over_limit from site_snapshot. If no rows match, answer that there are currently no sites identified as above the lice limit in the latest site snapshot."
         )
+    if "increasing lice pressure" in lowered or "increasing pressure" in lowered:
+        notes.append(
+            "Clarification: this is a historical trend question. Use master_table, compare the last 3 observed weeks against the preceding 3 observed weeks by production area among counted rows, define pressure using the average adult-female-lice-to-limit ratio, and rank areas by the size of the positive change. List only areas with a positive change. Do not answer from site_snapshot forecast risk."
+        )
+    if "before breaches" in lowered or "before a breach" in lowered or "before breach" in lowered:
+        notes.append(
+            "Clarification: this is a historical pre-breach analysis question. Use master_table and compare breach site-weeks to the preceding observed week or weeks for the same sites."
+        )
+    if "treatment intensity" in lowered:
+        notes.append(
+            "Clarification: this is a historical aggregation question. Use master_table and rank production areas by a normalized treatment rate across historical site-weeks rather than raw totals. Explain the result in plain language without internal metric or table names."
+        )
     if not notes:
         return normalized
     return normalized + "\n\n" + "\n".join(notes)
@@ -1004,6 +1032,8 @@ def _looks_like_interrupted_answer(answer: str) -> bool:
         "please try your request again",
         "could not retrieve the information",
         "i am sorry, but i could not retrieve",
+        "unable to answer your question",
+        "stopped before it could retrieve",
     ]
     return any(marker in text for marker in interruption_markers)
 
@@ -1035,6 +1065,73 @@ def _infer_site_card_metric(message: str) -> str:
 def _truncate_error(exc: Exception) -> str:
     message = f"{type(exc).__name__}: {exc}"
     return message if len(message) <= 400 else f"{message[:397]}..."
+
+
+def _simplify_answer_text(answer: str) -> str:
+    text = str(answer or "").strip()
+    if not text:
+        return text
+
+    replacements = [
+        (r"\bmaster_table\b", "historical data"),
+        (r"\bsite_snapshot\b", "current snapshot"),
+        (r"['`]?any_treatment['`]? metric", "treatment frequency"),
+        (r"\bany_treatment\b", "treatment frequency"),
+        (r"['`]?treatment_count['`]? metric", "treatment rate"),
+        (r"\btreatment_count\b", "treatment rate"),
+        (r"\bfemaleadult_to_limit_ratio\b", "adult female lice relative to the limit"),
+        (r"\bfemaleadult\b", "adult female lice count"),
+        (r"\bbreach_this_week\b", "breach status"),
+    ]
+    for pattern, replacement in replacements:
+        text = re.sub(pattern, replacement, text, flags=re.I)
+
+    text = re.sub(
+        r"average adult female lice-to-limit ratio over the last three observed weeks compared to the preceding three",
+        "recent movement toward the lice limit",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        r"ranked by the magnitude of the rise in the average adult female lice-to-limit ratio over the last three weeks compared to the preceding three weeks,?",
+        "ranked by the strength of the recent rise,",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        r"ratio of adult female lice to the regulatory limit",
+        "how close sites are to the regulatory limit",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        r"ratio of lice to the regulatory limit",
+        "how close sites are to the regulatory limit",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        r"adult female lice-to-limit ratio",
+        "distance to the lice limit",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        r"adult female lice count",
+        "adult female lice levels",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        r"increase in the how close sites are to the regulatory limit",
+        "move closer to the regulatory limit",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(r"Based on the historical (analysis|aggregation) of the historical data(?: for [^,]+)?,\s*", "", text, flags=re.I)
+    text = re.sub(r"Based on the historical (analysis|aggregation) of the current snapshot(?: for [^,]+)?,\s*", "", text, flags=re.I)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
 
 def _jsonify(value: object) -> object | None:
