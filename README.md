@@ -178,8 +178,6 @@ The backend builds a fresh in-memory DuckDB database per request, restricts the 
 - `results/model_comparison.csv`: comparison view across model variants.
 - `results/holdout_predictions.csv`: holdout predictions for inspection.
 - `results/feature_columns.csv`: feature list used in modeling.
-- `results/final_model_documentation.md`: model documentation and recommendations.
-- `results/model_tuning_journal.md`: tuning log and decision trail.
 - `results/xgb_short_horizon_benchmark.csv`: focused short-horizon benchmark artifact.
 - `results/models/*.pkl`: serialized classifier and regressor artifacts.
 
