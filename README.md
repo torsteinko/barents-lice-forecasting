@@ -13,7 +13,7 @@ The project is best understood as a reproducible research and demo repository ra
 - A latest-snapshot pipeline that applies saved models to the newest raw data without retraining on 2026 rows.
 - An interactive web map for browsing current site status, forecast risk, and model outputs.
 - A Gemini-powered SQL chat endpoint for querying the prepared datasets in natural language.
-- A separate Python port of the Stata-based salmon growth model from the case bonus task.
+- A separate Python port of a Stata-based salmon growth model.
 
 ## Project highlights
 
